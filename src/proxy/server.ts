@@ -313,6 +313,8 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
                 }
               }, 15_000)
 
+              const skipBlockIndices = new Set<number>()
+
               try {
                 for await (const message of response) {
                   if (streamClosed) {
@@ -332,8 +334,38 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
 
                     const event = message.event
                     const eventType = (event as any).type
+                    const eventIndex = (event as any).index as number | undefined
 
-                    // Forward ALL events transparently (including tool_use blocks)
+                    // Track MCP tool blocks (mcp__opencode__*) — these are internal tools
+                    // that the SDK executes. Don't forward them to OpenCode.
+                    if (eventType === "message_start") {
+                      skipBlockIndices.clear()
+                    }
+
+                    if (eventType === "content_block_start") {
+                      const block = (event as any).content_block
+                      if (block?.type === "tool_use" && typeof block.name === "string" && block.name.startsWith("mcp__")) {
+                        if (eventIndex !== undefined) skipBlockIndices.add(eventIndex)
+                        continue
+                      }
+                    }
+
+                    // Skip deltas and stops for MCP tool blocks
+                    if (eventIndex !== undefined && skipBlockIndices.has(eventIndex)) {
+                      continue
+                    }
+
+                    // For message_delta/message_stop: only skip if ALL content blocks in this
+                    // message were MCP tools (i.e., nothing was forwarded to the client)
+                    if (eventType === "message_delta" || eventType === "message_stop") {
+                      // If we forwarded any content blocks, forward the message events too
+                      const hasForwardedContent = eventsForwarded > 0 || skipBlockIndices.size === 0
+                      if (!hasForwardedContent && (event as any).delta?.stop_reason === "tool_use") {
+                        continue
+                      }
+                    }
+
+                    // Forward all other events (text, non-MCP tool_use like Task, message events)
                     const payload = encoder.encode(`event: ${eventType}\ndata: ${JSON.stringify(event)}\n\n`)
                     if (!safeEnqueue(payload, `stream_event:${eventType}`)) {
                       break
