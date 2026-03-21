@@ -15,30 +15,22 @@ We avoid that limitation by forwarding tool calls instead of executing them. Whe
 From Claude’s perspective, tool usage proceeds normally. From OpenCode’s perspective, it is interacting with the Anthropic API. Execution remains distributed according to the configured agents, allowing different models to handle different roles without being constrained by the SDK.
 
 ```
-┌──────────┐                ┌───────────────┐              ┌──────────────┐
-│          │                │               │              │              │
-│ OpenCode │ ─────────────► │    Proxy      │ ───────────► │  Claude Max  │
-│          │                │  (localhost)  │              │  (Agent SDK) │
-│          │                │               │              │              │
-│          │                │               │ ◄─────────── │  tool_use    │
-│          │                │ ◄──────────── │              │              │
-│          │                │  Intercept    │              └──────────────┘
-│          │                │  (stop turn)  │
-│          │                │       │
-│          │                │       ▼
-│          │                │  ┌──────────────┐
-│          │                │  │  OpenCode    │
-│          │                │  │  agent       │
-│          │                │  │  system      │
-│          │                │  └──────────────┘
-│          │                │       │
-│          │                │       ▼
-│          │                │ ◄────────────
-│          │                │  Resume turn
-│          │                │
-│          │ ◄───────────── │
-│          │  response      │
-└──────────┘                └───────────────┘
+OpenCode ──► Proxy (localhost) ──► Claude Max (Agent SDK)
+                                        │
+                                   tool_use response
+                                        │
+             Proxy intercepts ◄─────────┘
+             (stop turn)
+                  │
+                  ▼
+             OpenCode agent system
+             (routes to GPT-5.4, Gemini, etc.)
+                  │
+                  ▼
+             Proxy resumes SDK ──► Claude continues
+                  │
+                  ▼
+OpenCode ◄── final response
 ```
 
 ## How Passthrough Works
