@@ -51,10 +51,10 @@ export function parseAgentDescriptions(taskDescription: string): Map<string, str
  * We map based on the model name pattern, defaulting to 'inherit'
  * for non-Anthropic models (they'll use the parent session's model).
  */
-export function mapModelTier(model?: string): "sonnet" | "opus" | "haiku" | "inherit" {
+export function mapModelTier(model?: string): "sonnet" | "opus" | "opus[1m]" | "haiku" | "inherit" {
   if (!model) return "inherit"
   const lower = model.toLowerCase()
-  if (lower.includes("opus")) return "opus"
+  if (lower.includes("opus")) return "opus[1m]"
   if (lower.includes("haiku")) return "haiku"
   if (lower.includes("sonnet")) return "sonnet"
   return "inherit"

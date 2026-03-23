@@ -442,8 +442,8 @@ async function resolveClaudeExecutableAsync(): Promise<string> {
   }
 }
 
-function mapModelToClaudeModel(model: string): "sonnet" | "opus" | "haiku" {
-  if (model.includes("opus")) return "opus"
+function mapModelToClaudeModel(model: string): "sonnet" | "opus" | "opus[1m]" | "haiku" {
+  if (model.includes("opus")) return "opus[1m]"
   if (model.includes("haiku")) return "haiku"
   return "sonnet"
 }
