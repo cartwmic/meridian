@@ -57,6 +57,27 @@ export const dashboardHtml = `<!DOCTYPE html>
   .refresh-bar button:hover { border-color: var(--accent); }
   .refresh-indicator { font-size: 11px; color: var(--muted); }
   .empty { text-align: center; padding: 48px; color: var(--muted); }
+
+  /* Tabs */
+  .tabs { display: flex; gap: 0; margin-bottom: 20px; border-bottom: 1px solid var(--border); }
+  .tab { padding: 10px 20px; font-size: 13px; font-weight: 500; color: var(--muted); cursor: pointer;
+         border-bottom: 2px solid transparent; margin-bottom: -1px; transition: color 0.15s, border-color 0.15s;
+         user-select: none; }
+  .tab:hover { color: var(--text); }
+  .tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+  .tab-badge { font-size: 10px; padding: 1px 6px; border-radius: 10px; margin-left: 6px;
+               background: var(--border); color: var(--muted); font-variant-numeric: tabular-nums; }
+  .tab.active .tab-badge { background: rgba(88,166,255,0.15); color: var(--accent); }
+  .tab-panel { display: none; }
+  .tab-panel.active { display: block; }
+
+  /* Log filters */
+  .log-filters { display: flex; gap: 8px; margin-bottom: 12px; }
+  .log-filter { font-size: 11px; padding: 3px 10px; border-radius: 12px; cursor: pointer;
+                border: 1px solid var(--border); background: var(--surface); color: var(--muted);
+                transition: all 0.15s; }
+  .log-filter:hover { border-color: var(--accent); color: var(--text); }
+  .log-filter.active { background: rgba(88,166,255,0.1); border-color: var(--accent); color: var(--accent); }
 </style>
 </head>
 <body>
@@ -79,7 +100,10 @@ export const dashboardHtml = `<!DOCTYPE html>
 
 <script>
 const $ = s => document.querySelector(s);
+const $$ = s => document.querySelectorAll(s);
 let timer;
+let activeTab = 'requests';
+let activeLogFilter = 'all';
 
 function ms(v) {
   if (v == null) return '—';
@@ -106,13 +130,27 @@ function pctRow(label, color, phase) {
     + '</tr>';
 }
 
+function switchTab(tab) {
+  activeTab = tab;
+  $$('.tab').forEach(t => t.classList.toggle('active', t.dataset.tab === tab));
+  $$('.tab-panel').forEach(p => p.classList.toggle('active', p.id === 'panel-' + tab));
+}
+
+function setLogFilter(filter) {
+  activeLogFilter = filter;
+  $$('.log-filter').forEach(f => f.classList.toggle('active', f.dataset.filter === filter));
+  $$('.log-row').forEach(r => {
+    r.style.display = (filter === 'all' || r.dataset.category === filter) ? '' : 'none';
+  });
+}
+
 async function refresh() {
   const w = $('#window').value;
   try {
     const [summary, reqs, logs] = await Promise.all([
       fetch('/telemetry/summary?window=' + w).then(r => r.json()),
       fetch('/telemetry/requests?limit=50&since=' + (Date.now() - Number(w))).then(r => r.json()),
-      fetch('/telemetry/logs?limit=100&since=' + (Date.now() - Number(w))).then(r => r.json()),
+      fetch('/telemetry/logs?limit=200&since=' + (Date.now() - Number(w))).then(r => r.json()),
     ]);
     render(summary, reqs, logs);
     $('#lastUpdate').textContent = 'Updated ' + new Date().toLocaleTimeString();
@@ -122,13 +160,31 @@ async function refresh() {
 }
 
 function render(s, reqs, logs) {
-  if (s.totalRequests === 0) {
+  if (s.totalRequests === 0 && (!logs || logs.length === 0)) {
     $('#content').innerHTML = '<div class="empty">No requests recorded yet. Send a request through the proxy to see telemetry.</div>';
     return;
   }
 
+  // Count lineage types for badges
+  const lineageCounts = {};
+  for (const r of reqs) { const t = r.lineageType || 'unknown'; lineageCounts[t] = (lineageCounts[t] || 0) + 1; }
+  const logCounts = { session: 0, lineage: 0, error: 0 };
+  for (const l of logs) { if (logCounts[l.category] !== undefined) logCounts[l.category]++; }
+
+  // Tabs
+  let html = '<div class="tabs">'
+    + '<div class="tab' + (activeTab === 'overview' ? ' active' : '') + '" data-tab="overview" onclick="switchTab(\'overview\')">Overview</div>'
+    + '<div class="tab' + (activeTab === 'requests' ? ' active' : '') + '" data-tab="requests" onclick="switchTab(\'requests\')">'
+    +   'Requests<span class="tab-badge">' + reqs.length + '</span></div>'
+    + '<div class="tab' + (activeTab === 'logs' ? ' active' : '') + '" data-tab="logs" onclick="switchTab(\'logs\')">'
+    +   'Logs<span class="tab-badge">' + logs.length + '</span></div>'
+    + '</div>';
+
+  // ==================== Overview tab ====================
+  html += '<div id="panel-overview" class="tab-panel' + (activeTab === 'overview' ? ' active' : '') + '">';
+
   // Summary cards
-  let html = '<div class="cards">'
+  html += '<div class="cards">'
     + card('Requests', s.totalRequests, s.requestsPerMinute.toFixed(1) + ' req/min')
     + card('Errors', s.errorCount, s.totalRequests > 0 ? ((s.errorCount/s.totalRequests)*100).toFixed(1) + '% error rate' : '')
     + card('Median Total', ms(s.totalDuration.p50), 'p95: ' + ms(s.totalDuration.p95))
@@ -147,6 +203,17 @@ function render(s, reqs, logs) {
     html += '</div>';
   }
 
+  // Lineage breakdown
+  if (Object.keys(lineageCounts).length > 0) {
+    html += '<div class="cards">';
+    const lineageColors = {continuation:'var(--green)',compaction:'var(--yellow)',undo:'var(--purple)',diverged:'var(--red)',new:'var(--muted)'};
+    for (const [type, count] of Object.entries(lineageCounts)) {
+      html += '<div class="card"><div class="card-label">Lineage: ' + type + '</div>'
+        + '<div class="card-value" style="color:' + (lineageColors[type] || 'var(--text)') + '">' + count + '</div></div>';
+    }
+    html += '</div>';
+  }
+
   // Percentile table
   html += '<div class="section"><div class="section-title">Percentiles</div>'
     + '<table class="pct-table"><thead><tr><th>Phase</th><th>p50</th><th>p95</th><th>p99</th><th>Min</th><th>Max</th><th>Avg</th></tr></thead><tbody>'
@@ -157,9 +224,12 @@ function render(s, reqs, logs) {
     + pctRow('Total', 'var(--purple)', s.totalDuration)
     + '</tbody></table></div>';
 
-  // Recent requests waterfall
-  html += '<div class="section"><div class="section-title">Recent Requests</div>'
-    + '<div class="legend">'
+  html += '</div>'; // end overview panel
+
+  // ==================== Requests tab ====================
+  html += '<div id="panel-requests" class="tab-panel' + (activeTab === 'requests' ? ' active' : '') + '">';
+
+  html += '<div class="legend">'
     + '<span><span class="legend-dot" style="background:var(--queue)"></span>Queue</span>'
     + '<span><span class="legend-dot" style="background:var(--yellow)"></span>Proxy</span>'
     + '<span><span class="legend-dot" style="background:var(--ttfb)"></span>TTFB</span>'
@@ -201,28 +271,41 @@ function render(s, reqs, logs) {
       + '</div></td>'
       + '</tr>';
   }
-  html += '</tbody></table></div>';
+  html += '</tbody></table>';
+  html += '</div>'; // end requests panel
 
-  // Diagnostic logs panel
-  if (logs && logs.length > 0) {
-    html += '<div class="section"><div class="section-title">Diagnostic Logs</div>'
-      + '<div style="background:var(--surface);border:1px solid var(--border);border-radius:8px;overflow:hidden;max-height:400px;overflow-y:auto">'
-      + '<table style="width:100%;font-size:12px"><thead><tr>'
-      + '<th style="width:70px">Time</th><th style="width:60px">Level</th><th style="width:70px">Category</th><th>Message</th>'
+  // ==================== Logs tab ====================
+  html += '<div id="panel-logs" class="tab-panel' + (activeTab === 'logs' ? ' active' : '') + '">';
+
+  // Filter buttons
+  html += '<div class="log-filters">'
+    + '<span class="log-filter' + (activeLogFilter === 'all' ? ' active' : '') + '" data-filter="all" onclick="setLogFilter(\'all\')">All<span class="tab-badge">' + logs.length + '</span></span>'
+    + '<span class="log-filter' + (activeLogFilter === 'session' ? ' active' : '') + '" data-filter="session" onclick="setLogFilter(\'session\')" style="--accent:var(--blue)">Session<span class="tab-badge">' + logCounts.session + '</span></span>'
+    + '<span class="log-filter' + (activeLogFilter === 'lineage' ? ' active' : '') + '" data-filter="lineage" onclick="setLogFilter(\'lineage\')" style="--accent:var(--purple)">Lineage<span class="tab-badge">' + logCounts.lineage + '</span></span>'
+    + '<span class="log-filter' + (activeLogFilter === 'error' ? ' active' : '') + '" data-filter="error" onclick="setLogFilter(\'error\')" style="--accent:var(--red)">Error<span class="tab-badge">' + logCounts.error + '</span></span>'
+    + '</div>';
+
+  if (logs.length === 0) {
+    html += '<div class="empty">No diagnostic logs in this time window.</div>';
+  } else {
+    html += '<table><thead><tr>'
+      + '<th style="width:80px">Time</th><th style="width:55px">Level</th><th style="width:70px">Category</th><th>Message</th>'
       + '</tr></thead><tbody>';
 
     for (const log of logs) {
       const levelColor = {info:'var(--green)',warn:'var(--yellow)',error:'var(--red)'}[log.level] || 'var(--muted)';
       const catColor = {session:'var(--blue)',lineage:'var(--purple)',error:'var(--red)',lifecycle:'var(--muted)'}[log.category] || 'var(--muted)';
-      html += '<tr>'
+      const display = (activeLogFilter === 'all' || log.category === activeLogFilter) ? '' : 'display:none';
+      html += '<tr class="log-row" data-category="' + log.category + '" style="' + display + '">'
         + '<td class="mono">' + ago(log.timestamp) + '</td>'
         + '<td><span style="color:' + levelColor + '">' + log.level + '</span></td>'
         + '<td><span style="color:' + catColor + '">' + log.category + '</span></td>'
         + '<td class="mono" style="word-break:break-all">' + log.message + '</td>'
         + '</tr>';
     }
-    html += '</tbody></table></div></div>';
+    html += '</tbody></table>';
   }
+  html += '</div>'; // end logs panel
 
   $('#content').innerHTML = html;
 }
