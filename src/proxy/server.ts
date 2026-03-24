@@ -108,6 +108,32 @@ export function clearSessionCache() {
 // uses count-based pruning. SDK sessions persist on Anthropic's side for
 // weeks — we should never discard a valid mapping before the SDK does.
 
+/**
+ * Extract the client's working directory from the system prompt.
+ * OpenCode embeds it inside an <env> block:
+ *   <env>
+ *     Working directory: /path/to/project
+ *     ...
+ *   </env>
+ *
+ * Returns the path if found, or undefined to fall back to server defaults.
+ */
+function extractClientCwd(body: any): string | undefined {
+  let systemText = ""
+  if (typeof body.system === "string") {
+    systemText = body.system
+  } else if (Array.isArray(body.system)) {
+    systemText = body.system
+      .filter((b: any) => b.type === "text" && b.text)
+      .map((b: any) => b.text)
+      .join("\n")
+  }
+  if (!systemText) return undefined
+
+  const match = systemText.match(/<env>\s*[\s\S]*?Working directory:\s*([^\n<]+)/i)
+  return match?.[1]?.trim() || undefined
+}
+
 /** Hash the first user message + working directory to fingerprint a conversation.
  *  Used to find a cached session when no x-opencode-session header is present.
  *  Includes workingDirectory (stable per project, unlike systemContext which
@@ -528,7 +554,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
         const body = await c.req.json()
         const model = mapModelToClaudeModel(body.model || "sonnet")
         const stream = body.stream ?? true
-        const workingDirectory = process.env.CLAUDE_PROXY_WORKDIR || process.cwd()
+        const workingDirectory = extractClientCwd(body) || process.env.CLAUDE_PROXY_WORKDIR || process.cwd()
 
         // Strip env vars that would cause the SDK subprocess to loop back through
         // the proxy instead of using its native Claude Max auth. Also strip vars
