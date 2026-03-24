@@ -1,5 +1,19 @@
 # Changelog
 
+## [1.17.0](https://github.com/rynfar/opencode-claude-max-proxy/compare/v1.16.2...v1.17.0) (2026-03-24)
+
+
+### Features
+
+* add diagnostic log viewer to telemetry dashboard ([d7ab690](https://github.com/rynfar/opencode-claude-max-proxy/commit/d7ab690236f08e6f5c2cba9d043666a7efe8d33f))
+* add tabbed layout to telemetry dashboard ([6800ea5](https://github.com/rynfar/opencode-claude-max-proxy/commit/6800ea56e6a09744f50e24ca12a0b40ae50c6abf))
+* telemetry diagnostic log viewer with tabbed dashboard ([94f6c8b](https://github.com/rynfar/opencode-claude-max-proxy/commit/94f6c8bf30ddc31f384efe0c481168b6ddf305e9))
+
+
+### Bug Fixes
+
+* escape quotes in dashboard onclick handlers ([6728fc3](https://github.com/rynfar/opencode-claude-max-proxy/commit/6728fc31ea1679d653a89a7ea7622807cb95a0c1))
+
 ## [1.16.2](https://github.com/rynfar/opencode-claude-max-proxy/compare/v1.16.1...v1.16.2) (2026-03-24)
 
 
