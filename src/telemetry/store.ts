@@ -103,10 +103,11 @@ export class TelemetryStore {
     const upstreams = metrics.map(m => m.upstreamDurationMs)
     const totals = metrics.map(m => m.totalDurationMs)
 
-    // Model breakdown
+    // Model breakdown — use the client's original model string when available
     const byModel: Record<string, { count: number; totalMs: number }> = {}
     for (const m of metrics) {
-      const entry = byModel[m.model] ??= { count: 0, totalMs: 0 }
+      const modelKey = m.requestModel || m.model
+      const entry = byModel[modelKey] ??= { count: 0, totalMs: 0 }
       entry.count++
       entry.totalMs += m.totalDurationMs
     }

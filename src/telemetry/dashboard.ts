@@ -255,7 +255,7 @@ function render(s, reqs, logs) {
 
     html += '<tr>'
       + '<td class="mono">' + ago(r.timestamp) + '</td>'
-      + '<td>' + r.model + '</td>'
+      + '<td>' + (r.requestModel || r.model) + '<br><span style="font-size:10px;color:var(--muted)">' + r.model + '</span></td>'
       + '<td>' + r.mode + '</td>'
       + '<td class="mono">' + sessionShort + ' ' + lineageBadge + '<br><span style="font-size:10px;color:var(--muted)">' + msgCount + ' msgs</span></td>'
       + '<td class="' + statusClass + '">' + statusText + '</td>'

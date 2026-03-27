@@ -17,8 +17,11 @@ export interface RequestMetric {
   /** When this metric was recorded */
   timestamp: number
 
-  /** Model used (sonnet, opus, haiku) */
+  /** Model used for SDK query (sonnet, opus, haiku, sonnet[1m], etc.) */
   model: string
+
+  /** Original model string from the client request (e.g. "claude-sonnet-4-6-20250312") */
+  requestModel?: string
 
   /** Streaming or non-streaming */
   mode: "stream" | "non-stream"
