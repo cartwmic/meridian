@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.21.1](https://github.com/rynfar/opencode-claude-max-proxy/compare/v1.21.0...v1.21.1) (2026-03-29)
+
+
+### Bug Fixes
+
+* emit message_delta and message_stop before error on mid-stream failures ([#185](https://github.com/rynfar/opencode-claude-max-proxy/issues/185)) ([8bd9b48](https://github.com/rynfar/opencode-claude-max-proxy/commit/8bd9b48a69016a75a512c68fc9e79bbc2b2a09cd)), closes [#168](https://github.com/rynfar/opencode-claude-max-proxy/issues/168)
+
 ## [1.21.0](https://github.com/rynfar/opencode-claude-max-proxy/compare/v1.20.0...v1.21.0) (2026-03-29)
 
 
