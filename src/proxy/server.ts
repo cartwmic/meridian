@@ -438,6 +438,14 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
             ...(fileChangeHook ? { PostToolUse: [fileChangeHook] } : {}),
           }
 
+        // Capture subprocess stderr for all paths — used to surface the real
+        // failure message when the Claude subprocess exits with a non-zero code.
+        const stderrLines: string[] = []
+        const onStderr = (data: string) => {
+          stderrLines.push(data.trimEnd())
+          claudeLog("subprocess.stderr", { line: data.trimEnd() })
+        }
+
         if (!stream) {
           const contentBlocks: Array<Record<string, unknown>> = []
           let assistantMessages = 0
@@ -484,7 +492,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                   for await (const event of query(buildQueryOptions({
                     prompt: makePrompt(), model, workingDirectory, systemContext, claudeExecutable,
                     passthrough, stream: false, sdkAgents, passthroughMcp, cleanEnv,
-                    resumeSessionId, isUndo, undoRollbackUuid, sdkHooks, adapter,
+                    resumeSessionId, isUndo, undoRollbackUuid, sdkHooks, adapter, onStderr,
                   }))) {
                     if ((event as any).type === "assistant") {
                       didYieldContent = true
@@ -513,7 +521,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                       prompt: buildFreshPrompt(allMessages, stripCacheControl),
                       model, workingDirectory, systemContext, claudeExecutable,
                       passthrough, stream: false, sdkAgents, passthroughMcp, cleanEnv,
-                      resumeSessionId: undefined, isUndo: false, undoRollbackUuid: undefined, sdkHooks, adapter,
+                      resumeSessionId: undefined, isUndo: false, undoRollbackUuid: undefined, sdkHooks, adapter, onStderr,
                     }))
                     return
                   }
@@ -592,11 +600,16 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
               durationMs: Date.now() - upstreamStartAt
             })
           } catch (error) {
+            const stderrOutput = stderrLines.join("\n").trim()
+            if (stderrOutput && error instanceof Error && !error.message.includes(stderrOutput)) {
+              error.message = `${error.message}\nSubprocess stderr: ${stderrOutput}`
+            }
             claudeLog("upstream.failed", {
               mode: "non_stream",
               model,
               durationMs: Date.now() - upstreamStartAt,
-              error: error instanceof Error ? error.message : String(error)
+              error: error instanceof Error ? error.message : String(error),
+              ...(stderrOutput ? { stderr: stderrOutput } : {})
             })
             throw error
           }
@@ -774,7 +787,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                     for await (const event of query(buildQueryOptions({
                       prompt: makePrompt(), model, workingDirectory, systemContext, claudeExecutable,
                       passthrough, stream: true, sdkAgents, passthroughMcp, cleanEnv,
-                      resumeSessionId, isUndo, undoRollbackUuid, sdkHooks, adapter,
+                      resumeSessionId, isUndo, undoRollbackUuid, sdkHooks, adapter, onStderr,
                     }))) {
                       if ((event as any).type === "stream_event") {
                         didYieldClientEvent = true
@@ -803,7 +816,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                         prompt: buildFreshPrompt(allMessages, stripCacheControl),
                         model, workingDirectory, systemContext, claudeExecutable,
                         passthrough, stream: true, sdkAgents, passthroughMcp, cleanEnv,
-                        resumeSessionId: undefined, isUndo: false, undoRollbackUuid: undefined, sdkHooks, adapter,
+                        resumeSessionId: undefined, isUndo: false, undoRollbackUuid: undefined, sdkHooks, adapter, onStderr,
                       }))
                       return
                     }
@@ -1171,6 +1184,10 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                 return
               }
 
+              const stderrOutput = stderrLines.join("\n").trim()
+              if (stderrOutput && error instanceof Error && !error.message.includes(stderrOutput)) {
+                error.message = `${error.message}\nSubprocess stderr: ${stderrOutput}`
+              }
               const errMsg = error instanceof Error ? error.message : String(error)
               claudeLog("upstream.failed", {
                 mode: "stream",
@@ -1178,7 +1195,8 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                 durationMs: Date.now() - upstreamStartAt,
                 streamEventsSeen,
                 textEventsForwarded,
-                error: errMsg
+                error: errMsg,
+                ...(stderrOutput ? { stderr: stderrOutput } : {})
               })
               const streamErr = classifyError(errMsg)
               claudeLog("proxy.anthropic.error", { error: errMsg, classified: streamErr.type })

@@ -40,6 +40,8 @@ export interface QueryContext {
   sdkHooks?: any
   /** The agent adapter providing tool configuration */
   adapter: AgentAdapter
+  /** Callback to receive stderr lines from the Claude subprocess */
+  onStderr?: (line: string) => void
 }
 
 /**
@@ -51,7 +53,7 @@ export function buildQueryOptions(ctx: QueryContext) {
   const {
     prompt, model, workingDirectory, systemContext, claudeExecutable,
     passthrough, stream, sdkAgents, passthroughMcp, cleanEnv,
-    resumeSessionId, isUndo, undoRollbackUuid, sdkHooks, adapter,
+    resumeSessionId, isUndo, undoRollbackUuid, sdkHooks, adapter, onStderr,
   } = ctx
 
   const blockedTools = [...adapter.getBlockedBuiltinTools(), ...adapter.getAgentIncompatibleTools()]
@@ -92,6 +94,7 @@ export function buildQueryOptions(ctx: QueryContext) {
             mcpServers: { [mcpServerName]: createOpencodeMcpServer() },
           }),
       plugins: [],
+      ...(onStderr ? { stderr: onStderr } : {}),
       env: {
         ...cleanEnv,
         ENABLE_TOOL_SEARCH: "false",
