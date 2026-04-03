@@ -13,6 +13,7 @@ import {
   computeMessageHashes,
   verifyLineage,
   type SessionState,
+  type TokenUsage,
   type LineageResult,
 } from "./lineage"
 
@@ -182,10 +183,14 @@ export function lookupSession(
   return { type: "diverged" }
 }
 
-/** Look up a session state by its agent session ID.
- *  Returns undefined if not found. Used by the context-usage endpoint. */
-export function getSessionById(agentSessionId: string): SessionState | undefined {
-  return sessionCache.get(agentSessionId)
+/** Look up a session by the Claude SDK session ID returned in responses.
+ *  Searches the in-memory cache by `claudeSessionId` value.
+ *  Returns the matching state or undefined. */
+export function getSessionByClaudeId(claudeSessionId: string): SessionState | undefined {
+  for (const state of sessionCache.values()) {
+    if (state.claudeSessionId === claudeSessionId) return state
+  }
+  return undefined
 }
 
 /** Store a session mapping with lineage hash and SDK UUIDs for divergence detection.
@@ -194,11 +199,11 @@ export function getSessionById(agentSessionId: string): SessionState | undefined
  *  @param contextUsage — optional last observed token usage to attach to the session. */
 export function storeSession(
   sessionId: string | undefined,
-  messages: Array<{ role: string; content: any }>,
+  messages: Array<{ role: string; content: unknown }>,
   claudeSessionId: string,
   workingDirectory?: string,
   sdkMessageUuids?: Array<string | null>,
-  contextUsage?: Record<string, unknown>
+  contextUsage?: TokenUsage
 ) {
   if (!claudeSessionId) return
   const lineageHash = computeLineageHash(messages)

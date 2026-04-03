@@ -11,6 +11,14 @@ import { diagnosticLog } from "../../telemetry"
 
 // --- Types ---
 
+/** Token usage counters from the SDK (subset of Anthropic usage object). */
+export interface TokenUsage {
+  input_tokens?: number
+  output_tokens?: number
+  cache_read_input_tokens?: number
+  cache_creation_input_tokens?: number
+}
+
 /** Minimum suffix overlap (stored messages found at the end of incoming)
  *  required to classify a mutation as compaction rather than a branch. */
 export const MIN_SUFFIX_FOR_COMPACTION = 2
@@ -31,8 +39,8 @@ export interface SessionState {
    *  Only assistant messages have UUIDs (user messages are null).
    *  Used to find the rollback point for undo. */
   sdkMessageUuids?: Array<string | null>
-  /** Last observed context usage (input/output token counts) for this session */
-  contextUsage?: Record<string, unknown>
+  /** Last observed token usage for this session (from SDK message_start / message_delta events) */
+  contextUsage?: TokenUsage
 }
 
 /**

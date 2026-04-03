@@ -6,7 +6,7 @@
  */
 
 import type { AgentAdapter } from "./adapter"
-import type { SdkBeta } from "@anthropic-ai/claude-agent-sdk"
+import type { Options, SdkBeta } from "@anthropic-ai/claude-agent-sdk"
 import { createOpencodeMcpServer } from "../mcpTools"
 import { createPassthroughMcpServer, PASSTHROUGH_MCP_NAME } from "./passthroughTools"
 
@@ -58,7 +58,12 @@ export interface QueryContext {
  * This is called identically from both streaming and non-streaming paths,
  * with the only difference being `includePartialMessages` for streaming.
  */
-export function buildQueryOptions(ctx: QueryContext) {
+export interface BuildQueryResult {
+  prompt: QueryContext["prompt"]
+  options: Options
+}
+
+export function buildQueryOptions(ctx: QueryContext): BuildQueryResult {
   const {
     prompt, model, workingDirectory, systemContext, claudeExecutable,
     passthrough, stream, sdkAgents, passthroughMcp, cleanEnv,

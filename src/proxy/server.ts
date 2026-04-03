@@ -31,10 +31,11 @@ import {
   hashMessage,
   computeMessageHashes,
   type LineageResult,
+  type TokenUsage,
 } from "./session/lineage"
 // Re-export for backwards compatibility (existing tests import from here)
 
-import { lookupSession, storeSession, clearSessionCache, getMaxSessionsLimit, evictSession, getSessionById } from "./session/cache"
+import { lookupSession, storeSession, clearSessionCache, getMaxSessionsLimit, evictSession, getSessionByClaudeId } from "./session/cache"
 // Re-export for backwards compatibility (existing tests import from here)
 export { computeLineageHash, hashMessage, computeMessageHashes }
 export { clearSessionCache, getMaxSessionsLimit }
@@ -127,9 +128,15 @@ function buildFreshPrompt(
     .join("\n\n") || ""
 }
 
-function logUsage(requestId: string, usage: Record<string, number>): void {
+function logUsage(requestId: string, usage: TokenUsage): void {
   const fmt = (n: number) => n > 1000 ? `${Math.round(n / 1000)}k` : String(n)
-  console.error(`[PROXY] ${requestId} usage: input=${fmt(usage.input_tokens || 0)} output=${fmt(usage.output_tokens || 0)}${usage.cache_read_input_tokens ? ` cache_read=${fmt(usage.cache_read_input_tokens)}` : ""}${usage.cache_creation_input_tokens ? ` cache_write=${fmt(usage.cache_creation_input_tokens)}` : ""}`)
+  const parts = [
+    `input=${fmt(usage.input_tokens ?? 0)}`,
+    `output=${fmt(usage.output_tokens ?? 0)}`,
+    ...(usage.cache_read_input_tokens ? [`cache_read=${fmt(usage.cache_read_input_tokens)}`] : []),
+    ...(usage.cache_creation_input_tokens ? [`cache_write=${fmt(usage.cache_creation_input_tokens)}`] : []),
+  ]
+  console.error(`[PROXY] ${requestId} usage: ${parts.join(" ")}`)
 }
 
 export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServer {
@@ -241,7 +248,11 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
           || undefined
         let thinking: QueryContext['thinking'] | undefined
         if (thinkingHeader) {
-          try { thinking = JSON.parse(thinkingHeader) } catch { /* malformed header — ignore */ }
+          try {
+            thinking = JSON.parse(thinkingHeader) as QueryContext["thinking"]
+          } catch (e) {
+            console.error(`[PROXY] ${requestMeta.requestId} ignoring malformed x-opencode-thinking header: ${e instanceof Error ? e.message : String(e)}`)
+          }
         } else {
           thinking = body.thinking || undefined
         }
@@ -508,7 +519,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
           while (sdkUuidMap.length < allMessages.length) sdkUuidMap.push(null)
 
           claudeLog("upstream.start", { mode: "non_stream", model })
-          let lastUsage: Record<string, number> | undefined
+          let lastUsage: TokenUsage | undefined
 
           try {
             // Lazy-resolve executable if not already set (e.g. when using createProxyServer directly)
@@ -673,9 +684,9 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                   }
                   contentBlocks.push(b)
                 }
-              }
-              if ((message as any).message?.usage) {
-                lastUsage = (message as any).message.usage
+                // Capture token usage from the assistant message
+                const msgUsage = message.message.usage as TokenUsage | undefined
+                if (msgUsage) lastUsage = { ...lastUsage, ...msgUsage }
               }
             }
 
@@ -851,7 +862,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
             while (sdkUuidMap.length < allMessages.length) sdkUuidMap.push(null)
 
             let messageStartEmitted = false
-            let lastUsage: Record<string, number> | undefined
+            let lastUsage: TokenUsage | undefined
 
             try {
               let currentSessionId: string | undefined
@@ -1037,9 +1048,8 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                     if (eventType === "message_start") {
                       skipBlockIndices.clear()
                       sdkToClientIndex.clear()
-                      if ((event as any).message?.usage) {
-                        lastUsage = { ...lastUsage, ...(event as any).message.usage }
-                      }
+                      const startUsage = (event as unknown as { message?: { usage?: TokenUsage } }).message?.usage
+                      if (startUsage) lastUsage = { ...lastUsage, ...startUsage }
                       // Only emit the first message_start — subsequent ones are internal SDK turns
                       if (messageStartEmitted) {
                         continue
@@ -1088,9 +1098,8 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                     // Skip intermediate message_delta with stop_reason: tool_use
                     // (SDK is about to execute MCP tools and continue)
                     if (eventType === "message_delta") {
-                      if ((event as any).usage) {
-                        lastUsage = { ...lastUsage, ...(event as any).usage }
-                      }
+                      const deltaUsage = (event as unknown as { usage?: TokenUsage }).usage
+                      if (deltaUsage) lastUsage = { ...lastUsage, ...deltaUsage }
                       const stopReason = (event as any).delta?.stop_reason
                       if (stopReason === "tool_use" && skipBlockIndices.size > 0) {
                         // All tool_use blocks in this turn were MCP — skip this delta
@@ -1572,6 +1581,20 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
     const authStatus = await getClaudeAuthStatusAsync()
     const isMax = authStatus?.subscriptionType === "max"
     return c.json({ object: "list", data: buildModelList(isMax) })
+  })
+
+  // Returns the last observed token usage for a session, looked up by the Claude
+  // session ID that was returned in a prior /v1/messages response body.
+  app.get("/v1/sessions/:claudeSessionId/context-usage", (c) => {
+    const claudeSessionId = c.req.param("claudeSessionId")
+    const session = getSessionByClaudeId(claudeSessionId)
+    if (!session) {
+      return c.json({ error: "Session not found" }, 404)
+    }
+    if (!session.contextUsage) {
+      return c.json({ error: "No usage data available for this session" }, 404)
+    }
+    return c.json({ session_id: claudeSessionId, context_usage: session.contextUsage })
   })
 
   // Catch-all: log unhandled requests
