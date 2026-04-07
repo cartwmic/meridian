@@ -604,6 +604,9 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
       const trackFileChanges = !(process.env.MERIDIAN_NO_FILE_CHANGES ?? process.env.CLAUDE_PROXY_NO_FILE_CHANGES)
       const fileChangeHook = trackFileChanges ? createFileChangeHook(fileChanges, mcpPrefix) : undefined
 
+      // Track tools discovered via ToolSearch (deferred tools that get called)
+      const discoveredTools = new Set<string>()
+
       const sdkHooks = passthrough
         ? {
             PreToolUse: [{
@@ -612,9 +615,14 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                 // Let the SDK handle ToolSearch internally for deferred tool loading.
                 // ToolSearch is filtered from the response stream below.
                 if (input.tool_name === "ToolSearch") return undefined
+                // Track deferred tools that were discovered via ToolSearch
+                const toolName = stripMcpPrefix(input.tool_name)
+                if (hasDeferredTools && coreSet && !coreSet.has(toolName.toLowerCase())) {
+                  discoveredTools.add(toolName)
+                }
                 capturedToolUses.push({
                   id: input.tool_use_id,
-                  name: stripMcpPrefix(input.tool_name),
+                  name: toolName,
                   input: input.tool_input,
                 })
                 return {
@@ -865,6 +873,10 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
               durationMs: Date.now() - upstreamStartAt
             })
             if (lastUsage) logUsage(requestMeta.requestId, lastUsage)
+            if (discoveredTools.size > 0) {
+              const names = [...discoveredTools].join(", ")
+              console.error(`[PROXY] ${requestMeta.requestId} discovered=${discoveredTools.size} (${names})`)
+            }
           } catch (error) {
             const stderrOutput = stderrLines.join("\n").trim()
             if (stderrOutput && error instanceof Error && !error.message.includes(stderrOutput)) {
@@ -963,6 +975,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
             hasDeferredTools,
             deferredToolCount: hasDeferredTools ? deferredToolCount : undefined,
             toolCount,
+            discoveredTools: discoveredTools.size > 0 ? [...discoveredTools] : undefined,
             lineageType,
             messageCount: allMessages.length,
             sdkSessionId: currentSessionId || resumeSessionId,
@@ -1381,6 +1394,10 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                 textEventsForwarded
               })
               if (lastUsage) logUsage(requestMeta.requestId, lastUsage)
+              if (discoveredTools.size > 0) {
+                const names = [...discoveredTools].join(", ")
+                console.error(`[PROXY] ${requestMeta.requestId} discovered=${discoveredTools.size} (${names})`)
+              }
 
               // Store session for future resume
               if (currentSessionId) {
