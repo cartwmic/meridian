@@ -1,0 +1,181 @@
+/**
+ * Deferred tool loading in passthrough mode.
+ *
+ * When tools have defer_loading: true, Meridian enables the SDK's ToolSearch
+ * mechanism. Non-deferred tools are marked alwaysLoad. ToolSearch calls are
+ * handled internally by the SDK and filtered from responses.
+ */
+
+import { describe, it, expect, mock, beforeEach, afterEach } from "bun:test"
+import {
+  messageStart,
+  toolUseBlockStart,
+  inputJsonDelta,
+  blockStop,
+  messageDelta,
+  messageStop,
+  parseSSE,
+  assistantMessage,
+  makeRequest,
+} from "./helpers"
+import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk"
+
+// ─── SDK mock ────────────────────────────────────────────────────────────────
+let mockMessages: SDKMessage[] = []
+let capturedQueryParams: any = {}
+
+mock.module("@anthropic-ai/claude-agent-sdk", () => ({
+  query: (opts: any) => {
+    capturedQueryParams = opts
+    return (async function* () {
+      for (const msg of mockMessages) yield msg
+    })()
+  },
+  createSdkMcpServer: () => ({
+    type: "sdk",
+    name: "test",
+    instance: { tool: () => {} },
+  }),
+}))
+
+mock.module("../logger", () => ({
+  claudeLog: () => {},
+  withClaudeLogContext: (_ctx: unknown, fn: () => unknown) => fn(),
+}))
+
+mock.module("../mcpTools", () => ({
+  createOpencodeMcpServer: () => ({ type: "sdk", name: "opencode", instance: { tool: () => {} } }),
+}))
+
+const { createProxyServer, clearSessionCache } = await import("../proxy/server")
+
+function app() {
+  const { app } = createProxyServer({ port: 0, host: "127.0.0.1" })
+  return app
+}
+
+const ALWAYS_LOADED_TOOL = {
+  name: "read",
+  description: "Read a file",
+  input_schema: { type: "object", properties: { path: { type: "string" } }, required: ["path"] },
+}
+
+const DEFERRED_TOOL = {
+  name: "custom_lint",
+  description: "Run custom linter",
+  input_schema: { type: "object", properties: { file: { type: "string" } }, required: ["file"] },
+  defer_loading: true,
+}
+
+let savedPassthrough: string | undefined
+
+beforeEach(() => {
+  clearSessionCache()
+  mockMessages = []
+  capturedQueryParams = {}
+  savedPassthrough = process.env.MERIDIAN_PASSTHROUGH
+  process.env.MERIDIAN_PASSTHROUGH = "1"
+})
+
+afterEach(() => {
+  if (savedPassthrough !== undefined) process.env.MERIDIAN_PASSTHROUGH = savedPassthrough
+  else delete process.env.MERIDIAN_PASSTHROUGH
+})
+
+describe("deferred tool loading — query options", () => {
+  it("sets ENABLE_TOOL_SEARCH=true when tools have defer_loading", async () => {
+    mockMessages = [assistantMessage([{ type: "text", text: "Hello" }])]
+
+    await app().fetch(new Request("http://localhost/v1/messages", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(makeRequest({
+        stream: false,
+        tools: [ALWAYS_LOADED_TOOL, DEFERRED_TOOL],
+        messages: [{ role: "user", content: "Lint my code" }],
+      })),
+    }))
+
+    expect(capturedQueryParams.options.env.ENABLE_TOOL_SEARCH).toBe("true")
+  })
+
+  it("sets ENABLE_TOOL_SEARCH=false when no tools have defer_loading", async () => {
+    mockMessages = [assistantMessage([{ type: "text", text: "Hello" }])]
+
+    await app().fetch(new Request("http://localhost/v1/messages", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(makeRequest({
+        stream: false,
+        tools: [ALWAYS_LOADED_TOOL],
+        messages: [{ role: "user", content: "Read a file" }],
+      })),
+    }))
+
+    expect(capturedQueryParams.options.env.ENABLE_TOOL_SEARCH).toBe("false")
+  })
+})
+
+describe("deferred tool loading — ToolSearch filtering", () => {
+  it("filters ToolSearch tool_use blocks from streaming responses", async () => {
+    mockMessages = [
+      messageStart(),
+      // ToolSearch call (SDK internal — should be filtered)
+      toolUseBlockStart(0, "ToolSearch", "tu_search_001"),
+      inputJsonDelta(0, '{"query":"custom_lint"}'),
+      blockStop(0),
+      // Actual tool call (should pass through)
+      toolUseBlockStart(1, "mcp__oc__custom_lint", "tu_lint_001"),
+      inputJsonDelta(1, '{"file":"/tmp/app.ts"}'),
+      blockStop(1),
+      messageDelta("tool_use"),
+      messageStop(),
+    ]
+
+    const res = await app().fetch(new Request("http://localhost/v1/messages", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(makeRequest({
+        stream: true,
+        tools: [ALWAYS_LOADED_TOOL, DEFERRED_TOOL],
+        messages: [{ role: "user", content: "Lint my code" }],
+      })),
+    }))
+
+    const text = await res.text()
+    const events = parseSSE(text)
+
+    const blockStarts = events.filter((e) => e.event === "content_block_start")
+    const toolNames = blockStarts
+      .filter((e) => (e.data as any).content_block?.type === "tool_use")
+      .map((e) => (e.data as any).content_block?.name)
+
+    expect(toolNames).not.toContain("ToolSearch")
+    expect(toolNames).toContain("custom_lint")
+  })
+
+  it("filters ToolSearch from non-streaming responses", async () => {
+    const PREFIX = "mcp__oc__"
+    mockMessages = [assistantMessage([
+      { type: "tool_use", id: "tu_search_002", name: "ToolSearch", input: { query: "custom_lint" } },
+      { type: "tool_use", id: "tu_lint_002", name: `${PREFIX}custom_lint`, input: { file: "/tmp/app.ts" } },
+    ])]
+
+    const res = await app().fetch(new Request("http://localhost/v1/messages", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(makeRequest({
+        stream: false,
+        tools: [ALWAYS_LOADED_TOOL, DEFERRED_TOOL],
+        messages: [{ role: "user", content: "Lint my code" }],
+      })),
+    }))
+
+    const body = await res.json() as Record<string, unknown>
+    const content = body.content as Array<Record<string, unknown>>
+    const toolNames = content.filter((b) => b.type === "tool_use").map((b) => b.name)
+
+    expect(toolNames).not.toContain("ToolSearch")
+    expect(toolNames).toContain("custom_lint")
+  })
+})
