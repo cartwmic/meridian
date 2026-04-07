@@ -85,6 +85,14 @@ export class TelemetryStore {
         totalDuration: emptyPhase,
         byModel: {},
         byMode: {},
+        tokenUsage: {
+          totalInputTokens: 0,
+          totalOutputTokens: 0,
+          totalCacheReadTokens: 0,
+          totalCacheCreationTokens: 0,
+          avgCacheHitRate: 0,
+          cacheMissOnResumeCount: 0,
+        },
       }
     }
 
@@ -120,6 +128,29 @@ export class TelemetryStore {
       entry.totalMs += m.totalDurationMs
     }
 
+    // Token usage aggregation
+    let totalInputTokens = 0
+    let totalOutputTokens = 0
+    let totalCacheReadTokens = 0
+    let totalCacheCreationTokens = 0
+    let cacheHitRateSum = 0
+    let cacheHitRateCount = 0
+    let cacheMissOnResumeCount = 0
+
+    for (const m of metrics) {
+      totalInputTokens += m.inputTokens ?? 0
+      totalOutputTokens += m.outputTokens ?? 0
+      totalCacheReadTokens += m.cacheReadInputTokens ?? 0
+      totalCacheCreationTokens += m.cacheCreationInputTokens ?? 0
+      if (m.cacheHitRate !== undefined) {
+        cacheHitRateSum += m.cacheHitRate
+        cacheHitRateCount++
+      }
+      if (m.isResume && m.cacheHitRate !== undefined && m.cacheHitRate === 0) {
+        cacheMissOnResumeCount++
+      }
+    }
+
     return {
       windowMs,
       totalRequests: metrics.length,
@@ -136,6 +167,16 @@ export class TelemetryStore {
       byMode: Object.fromEntries(
         Object.entries(byMode).map(([k, v]) => [k, { count: v.count, avgTotalMs: Math.round(v.totalMs / v.count) }])
       ),
+      tokenUsage: {
+        totalInputTokens,
+        totalOutputTokens,
+        totalCacheReadTokens,
+        totalCacheCreationTokens,
+        avgCacheHitRate: cacheHitRateCount > 0
+          ? Math.round((cacheHitRateSum / cacheHitRateCount) * 100) / 100
+          : 0,
+        cacheMissOnResumeCount,
+      },
     }
   }
 

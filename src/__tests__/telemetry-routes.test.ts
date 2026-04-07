@@ -111,4 +111,33 @@ describe("Telemetry routes", () => {
     expect(res.status).toBe(200)
     // Should not crash, just caps internally
   })
+
+  it("GET /telemetry/summary includes token usage stats", async () => {
+    telemetryStore.record(makeMetric({
+      inputTokens: 1000, outputTokens: 200,
+      cacheReadInputTokens: 800, cacheCreationInputTokens: 100,
+      cacheHitRate: 0.8, isResume: true,
+    }))
+    telemetryStore.record(makeMetric({
+      inputTokens: 2000, outputTokens: 400,
+      cacheReadInputTokens: 0, cacheCreationInputTokens: 1500,
+      cacheHitRate: 0, isResume: true,
+    }))
+    telemetryStore.record(makeMetric({
+      inputTokens: 1500, outputTokens: 300,
+      cacheReadInputTokens: 1200, cacheCreationInputTokens: 50,
+      cacheHitRate: 0.8, isResume: false,
+    }))
+
+    const res = await app.fetch(new Request("http://localhost/telemetry/summary"))
+    const body = await res.json() as any
+
+    expect(body.tokenUsage).toBeDefined()
+    expect(body.tokenUsage.totalInputTokens).toBe(4500)
+    expect(body.tokenUsage.totalOutputTokens).toBe(900)
+    expect(body.tokenUsage.totalCacheReadTokens).toBe(2000)
+    expect(body.tokenUsage.totalCacheCreationTokens).toBe(1650)
+    expect(body.tokenUsage.cacheMissOnResumeCount).toBe(1)
+    expect(body.tokenUsage.avgCacheHitRate).toBeCloseTo(0.53, 1)
+  })
 })
