@@ -77,6 +77,22 @@ export interface RequestMetric {
 
   /** Error type if the request failed, null if successful */
   error: string | null
+
+  /** Input tokens consumed (from SDK usage) */
+  inputTokens?: number
+
+  /** Output tokens generated */
+  outputTokens?: number
+
+  /** Input tokens read from prompt cache (lower cost) */
+  cacheReadInputTokens?: number
+
+  /** Input tokens written to prompt cache (one-time cost) */
+  cacheCreationInputTokens?: number
+
+  /** Cache hit ratio: cacheRead / (cacheRead + cacheCreation + uncached).
+   *  1.0 = perfect caching, 0.0 = no caching. undefined when no token data. */
+  cacheHitRate?: number
 }
 
 export interface PhaseTiming {
@@ -109,4 +125,15 @@ export interface TelemetrySummary {
   byModel: Record<string, { count: number; avgTotalMs: number }>
   /** Breakdown by mode */
   byMode: Record<string, { count: number; avgTotalMs: number }>
+
+  /** Aggregate token usage across all requests in the window */
+  tokenUsage: {
+    totalInputTokens: number
+    totalOutputTokens: number
+    totalCacheReadTokens: number
+    totalCacheCreationTokens: number
+    avgCacheHitRate: number
+    /** Requests where cache hit rate was 0 despite being a resume */
+    cacheMissOnResumeCount: number
+  }
 }

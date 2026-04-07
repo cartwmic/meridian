@@ -20,6 +20,11 @@ function makeMetric(overrides: Partial<RequestMetric> = {}): RequestMetric {
     contentBlocks: 3,
     textEvents: 10,
     error: null,
+    inputTokens: 1000,
+    outputTokens: 500,
+    cacheReadInputTokens: 800,
+    cacheCreationInputTokens: 100,
+    cacheHitRate: 0.89,
     ...overrides,
   }
 }
