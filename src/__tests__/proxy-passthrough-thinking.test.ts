@@ -15,9 +15,10 @@
  *
  * Bug 2 — Thinking blocks forwarded to non-native clients (both modes):
  *   type:"thinking" / type:"redacted_thinking" blocks contain an encrypted
- *   signature that is only valid in Claude's native context. OpenCode has no
- *   renderer for them and can misinterpret them.
- *   Fix: strip thinking/redacted_thinking blocks in passthrough mode.
+ *   signature that is only valid in Claude's native context. Some clients
+ *   have no renderer for them and can misinterpret them.
+ *   Fix: strip thinking/redacted_thinking blocks in passthrough mode UNLESS
+ *   the adapter's supportsThinking() returns true (e.g. OpenCode).
  */
 
 import { describe, it, expect, mock, beforeEach } from "bun:test"
@@ -205,7 +206,7 @@ describe("passthrough non-streaming — Turn 2 suppression", () => {
     expect(body.stop_reason).toBe("end_turn")
   })
 
-  it("strips thinking blocks from Turn 1 in non-streaming passthrough", async () => {
+  it("forwards thinking blocks in Turn 1 for adapters that support thinking", async () => {
     // Turn 1: thinking + tool_use (Claude with extended thinking enabled)
     const turn1 = assistantMessage([
       { type: "thinking", thinking: "Let me plan the edit...", signature: "enc_sig_abc" },
@@ -219,11 +220,11 @@ describe("passthrough non-streaming — Turn 2 suppression", () => {
 
     const types = (body.content as Array<Record<string, unknown>>).map((b) => b.type)
     expect(types).toContain("tool_use")
-    expect(types).not.toContain("thinking")
+    expect(types).toContain("thinking")
     expect(body.stop_reason).toBe("tool_use")
   })
 
-  it("strips redacted_thinking blocks from passthrough non-streaming", async () => {
+  it("forwards redacted_thinking blocks for adapters that support thinking", async () => {
     const turn1 = assistantMessage([
       { type: "redacted_thinking", data: "redacted_data_xyz" },
       { type: "tool_use", id: "tu_003", name: `${PREFIX}edit`,
@@ -235,11 +236,11 @@ describe("passthrough non-streaming — Turn 2 suppression", () => {
     const body = await res.json() as Record<string, unknown>
 
     const types = (body.content as Array<Record<string, unknown>>).map((b) => b.type)
-    expect(types).not.toContain("redacted_thinking")
+    expect(types).toContain("redacted_thinking")
     expect(types).toContain("tool_use")
   })
 
-  it("preserves tool_use input fields intact after stripping thinking", async () => {
+  it("preserves tool_use input fields alongside forwarded thinking blocks", async () => {
     const turn1 = assistantMessage([
       { type: "thinking", thinking: "Planning...", signature: "enc_sig" },
       {
@@ -267,7 +268,7 @@ describe("passthrough non-streaming — Turn 2 suppression", () => {
 // ─────────────────────────────────────────────────────────────────────────────
 
 describe("passthrough streaming — thinking block filtering", () => {
-  it("strips thinking content_block_start and its deltas from the stream", async () => {
+  it("forwards thinking content_block_start and its deltas in the stream", async () => {
     mockMessages = [
       messageStart(),
       thinkingBlockStart(0),
@@ -286,23 +287,20 @@ describe("passthrough streaming — thinking block filtering", () => {
     const text = await res.text()
     const events = parseSSE(text)
 
-    // No content_block_start for a thinking block should appear
+    // Thinking blocks should be forwarded for adapters that support them
     const blockStarts = events.filter((e) => e.event === "content_block_start")
-    for (const bs of blockStarts) {
-      expect((bs.data as any).content_block?.type).not.toBe("thinking")
-      expect((bs.data as any).content_block?.type).not.toBe("redacted_thinking")
-    }
+    const blockTypes = blockStarts.map((e) => (e.data as any).content_block?.type)
+    expect(blockTypes).toContain("thinking")
 
-    // No thinking_delta events should appear
+    // Thinking deltas should also be present
     const deltas = events.filter((e) => e.event === "content_block_delta")
-    for (const d of deltas) {
-      expect((d.data as any).delta?.type).not.toBe("thinking_delta")
-    }
+    const hasThinkinDelta = deltas.some((d) => (d.data as any).delta?.type === "thinking_delta")
+    expect(hasThinkinDelta).toBe(true)
   })
 
-  it("forwards the tool_use block with correct index after stripping thinking", async () => {
+  it("forwards thinking and tool_use blocks with correct indices", async () => {
     // Thinking at SDK index 0, tool_use at SDK index 1
-    // After stripping thinking, tool_use should be remapped to client index 0
+    // Both should be forwarded with their original indices
     mockMessages = [
       messageStart(),
       thinkingBlockStart(0),
@@ -318,11 +316,16 @@ describe("passthrough streaming — thinking block filtering", () => {
     const events = parseSSE(text)
 
     const blockStarts = events.filter((e) => e.event === "content_block_start")
-    expect(blockStarts.length).toBe(1)
-    const tuStart = blockStarts[0]!
-    expect((tuStart.data as any).content_block?.type).toBe("tool_use")
-    expect((tuStart.data as any).content_block?.name).toBe("edit")  // prefix stripped
-    expect((tuStart.data as any).index).toBe(0)  // remapped to 0 (thinking was skipped)
+    expect(blockStarts.length).toBe(2)  // thinking + tool_use (was 1)
+
+    const thinkingStart = blockStarts.find((e) => (e.data as any).content_block?.type === "thinking")
+    expect(thinkingStart).toBeDefined()
+    expect((thinkingStart!.data as any).index).toBe(0)
+
+    const tuStart = blockStarts.find((e) => (e.data as any).content_block?.type === "tool_use")
+    expect(tuStart).toBeDefined()
+    expect((tuStart!.data as any).content_block?.name).toBe("edit")  // prefix stripped
+    expect((tuStart!.data as any).index).toBe(1)  // was 0 when thinking was stripped
   })
 
   it("tool_use input is complete and parseable after streaming", async () => {
