@@ -820,7 +820,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                   for (const block of message.message.content) {
                     const b = block as unknown as Record<string, unknown>
                     // Strip thinking blocks — meaningless to non-native clients
-                    if (passthrough && (b.type === "thinking" || b.type === "redacted_thinking")) {
+                    if (passthrough && !adapter.supportsThinking?.() && (b.type === "thinking" || b.type === "redacted_thinking")) {
                       claudeLog("passthrough.thinking_stripped", { mode: "non_stream", type: b.type })
                       continue
                     }
@@ -1250,6 +1250,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                       // encrypted signature field.
                       if (
                         passthrough &&
+                        !adapter.supportsThinking?.() &&
                         (block?.type === "thinking" || block?.type === "redacted_thinking")
                       ) {
                         if (eventIndex !== undefined) skipBlockIndices.add(eventIndex)
