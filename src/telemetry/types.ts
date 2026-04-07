@@ -43,6 +43,9 @@ export interface RequestMetric {
    *  - new:          first request, no stored session to compare */
   lineageType?: "continuation" | "compaction" | "undo" | "diverged" | "new"
 
+  /** Whether deferred tool loading was active (defer_loading: true on any tool) */
+  hasDeferredTools?: boolean
+
   /** Number of messages in the request */
   messageCount?: number
 

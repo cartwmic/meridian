@@ -394,7 +394,8 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
         }).join(" → ")
         const lineageType = lineageResult.type === "diverged" && !cachedSession ? "new" : lineageResult.type
         const msgCount = Array.isArray(body.messages) ? body.messages.length : 0
-        const requestLogLine = `${requestMeta.requestId} adapter=${adapter.name} model=${model} stream=${stream} tools=${body.tools?.length ?? 0} lineage=${lineageType} session=${resumeSessionId?.slice(0, 8) || "new"}${isUndo && undoRollbackUuid ? ` rollback=${undoRollbackUuid.slice(0, 8)}` : ""}${agentMode ? ` agent=${agentMode}` : ""} active=${activeSessions}/${MAX_CONCURRENT_SESSIONS} msgCount=${msgCount}`
+        const deferredCount = body.tools?.filter((t: any) => t.defer_loading)?.length ?? 0
+        const requestLogLine = `${requestMeta.requestId} adapter=${adapter.name} model=${model} stream=${stream} tools=${body.tools?.length ?? 0}${deferredCount > 0 ? ` deferred=${deferredCount}` : ""} lineage=${lineageType} session=${resumeSessionId?.slice(0, 8) || "new"}${isUndo && undoRollbackUuid ? ` rollback=${undoRollbackUuid.slice(0, 8)}` : ""}${agentMode ? ` agent=${agentMode}` : ""} active=${activeSessions}/${MAX_CONCURRENT_SESSIONS} msgCount=${msgCount}`
         console.error(`[PROXY] ${requestLogLine} msgs=${msgSummary}`)
         diagnosticLog.session(`${requestLogLine}`, requestMeta.requestId)
 
@@ -951,6 +952,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
             mode: "non-stream",
             isResume,
             isPassthrough: passthrough,
+            hasDeferredTools,
             lineageType,
             messageCount: allMessages.length,
             sdkSessionId: currentSessionId || resumeSessionId,
@@ -1510,6 +1512,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                   mode: "stream",
                   isResume,
                   isPassthrough: passthrough,
+                  hasDeferredTools,
                   lineageType,
                   messageCount: allMessages.length,
                   sdkSessionId: currentSessionId || resumeSessionId,
@@ -1626,6 +1629,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
           mode: "non-stream",
           isResume: false,
           isPassthrough: envBool("PASSTHROUGH"),
+          hasDeferredTools: undefined,
           lineageType: undefined,
           messageCount: undefined,
           sdkSessionId: undefined,
