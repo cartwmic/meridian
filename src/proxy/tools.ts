@@ -25,7 +25,6 @@ export const BLOCKED_BUILTIN_TOOLS = [
  * are blocked so Claude uses the agent's version instead of the SDK's.
  */
 export const CLAUDE_CODE_ONLY_TOOLS = [
-  "ToolSearch",        // Claude Code deferred tool loading (internal mechanism)
   "CronCreate",        // Claude Code cron jobs
   "CronDelete",        // Claude Code cron jobs
   "CronList",          // Claude Code cron jobs

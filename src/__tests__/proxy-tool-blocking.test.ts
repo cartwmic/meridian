@@ -67,7 +67,6 @@ const BLOCKED_BUILTIN_TOOLS = [
 ]
 
 const CLAUDE_CODE_ONLY_TOOLS = [
-  "ToolSearch",
   "CronCreate", "CronDelete", "CronList",
   "EnterPlanMode", "ExitPlanMode",
   "EnterWorktree", "ExitWorktree",
