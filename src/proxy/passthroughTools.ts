@@ -61,7 +61,12 @@ export function createPassthroughMcpServer(
   const server = createSdkMcpServer({ name: PASSTHROUGH_MCP_NAME })
   const toolNames: string[] = []
 
-  for (const tool of tools) {
+  // Sort tools alphabetically by name to ensure deterministic MCP registration
+  // order. Non-deterministic ordering changes the SDK system prompt between
+  // requests, invalidating prompt cache and causing full context re-reads.
+  const sortedTools = [...tools].sort((a, b) => a.name.localeCompare(b.name))
+
+  for (const tool of sortedTools) {
     try {
       // Convert OpenCode's JSON Schema to Zod for MCP registration
       const zodSchema = tool.input_schema?.properties
