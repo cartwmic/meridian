@@ -146,9 +146,7 @@ export const piAdapter: AgentAdapter = {
    * Like Crush, defer to CLAUDE_PROXY_PASSTHROUGH env var so the same
    * global setting controls both agents.
    */
-  usesPassthrough(): boolean {
-    return true
-  },
+  // usesPassthrough not defined — defers to CLAUDE_PROXY_PASSTHROUGH env var
 
   /**
    * Pi uses lowercase tool names: read, write, edit, bash.
