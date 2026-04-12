@@ -154,16 +154,11 @@ export const piAdapter: AgentAdapter = {
    * tool_result cycle). Passthrough mode is appropriate: the proxy returns
    * tool_use blocks to pi, which executes them and sends back tool_results.
    *
-   * Defaults to true but defers to CLAUDE_PROXY_PASSTHROUGH env var so the
-   * same global setting controls all passthrough agents.
+   * Like main, defer to MERIDIAN_PASSTHROUGH / CLAUDE_PROXY_PASSTHROUGH via
+   * the global envBool("PASSTHROUGH") fallback instead of overriding here.
    */
-  usesPassthrough(): boolean {
-    const envVal = process.env.MERIDIAN_PASSTHROUGH ?? process.env.CLAUDE_PROXY_PASSTHROUGH
-    if (envVal === "0" || envVal === "false" || envVal === "no") {
-      return false
-    }
-    return true
-  },
+  // usesPassthrough not defined — defers to global PASSTHROUGH env resolution
+
 
   /**
    * Pi uses lowercase tool names: read, write, edit, bash.
