@@ -118,6 +118,17 @@ export const piAdapter: AgentAdapter = {
   },
 
   /**
+   * Core tools that should always be loaded (never deferred).
+   * When pi sends more tools than the defer threshold (e.g. MCP tools from
+   * basic-memory, playwright, etc.), non-core tools are auto-deferred.
+   * This ensures hasDeferredTools=true, which sets maxTurns=3 instead of 2,
+   * giving the SDK enough turns to complete a tool roundtrip.
+   */
+  getCoreToolNames(): readonly string[] {
+    return ["read", "write", "edit", "bash", "glob", "grep"]
+  },
+
+  /**
    * Pi can display thinking tokens — pass them through in passthrough mode.
    */
   supportsThinking(): boolean {
@@ -143,10 +154,16 @@ export const piAdapter: AgentAdapter = {
    * tool_result cycle). Passthrough mode is appropriate: the proxy returns
    * tool_use blocks to pi, which executes them and sends back tool_results.
    *
-   * Like Crush, defer to CLAUDE_PROXY_PASSTHROUGH env var so the same
-   * global setting controls both agents.
+   * Defaults to true but defers to CLAUDE_PROXY_PASSTHROUGH env var so the
+   * same global setting controls all passthrough agents.
    */
-  // usesPassthrough not defined — defers to CLAUDE_PROXY_PASSTHROUGH env var
+  usesPassthrough(): boolean {
+    const envVal = process.env.MERIDIAN_PASSTHROUGH ?? process.env.CLAUDE_PROXY_PASSTHROUGH
+    if (envVal === "0" || envVal === "false" || envVal === "no") {
+      return false
+    }
+    return true
+  },
 
   /**
    * Pi uses lowercase tool names: read, write, edit, bash.
