@@ -137,8 +137,10 @@ export function buildQueryOptions(ctx: QueryContext): BuildQueryResult {
       // On resume: the SDK may spend a turn rehydrating session state before
       // the model responds, so allow 3 turns to prevent "max turns (2)" errors.
       // With deferred tools: ToolSearch consumes a turn before the actual tool
-      // call, so allow 3 turns to give room for search + call + handoff.
-      maxTurns: passthrough ? ((resumeSessionId || hasDeferredTools) ? 3 : 2) : 200,
+      // call. The full flow is: ToolSearch → tool call → tool result + response.
+      // Allow 5 turns to handle multi-step deferred tool chains without hitting
+      // the limit before the final response is generated.
+      maxTurns: passthrough ? ((resumeSessionId || hasDeferredTools) ? 5 : 2) : 200,
       cwd: workingDirectory,
       model,
       pathToClaudeCodeExecutable: claudeExecutable,
