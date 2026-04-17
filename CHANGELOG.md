@@ -1,5 +1,21 @@
 # Changelog
 
+## [1.36.0](https://github.com/cartwmic/meridian/compare/meridian-v1.35.0...meridian-v1.36.0) (2026-04-17)
+
+
+### Features
+
+* add optional API key authentication for network-exposed deployments ([19a1206](https://github.com/cartwmic/meridian/commit/19a1206f1569630d3cc09f6145b4b2cff3065895))
+
+
+### Bug Fixes
+
+* handle all SDK stale session error variants ([4c19d48](https://github.com/cartwmic/meridian/commit/4c19d488a42b430c104c01ee1308c4a54059c044)), closes [#333](https://github.com/cartwmic/meridian/issues/333)
+* **passthrough:** enable strict MCP config for passthrough MCP ([5bd0928](https://github.com/cartwmic/meridian/commit/5bd0928f043bd148fa76340ea470e443cc295792))
+* **passthrough:** increase maxTurns from 3 to 5 for deferred tools ([9c56eee](https://github.com/cartwmic/meridian/commit/9c56eee97d4df0b586ede39c7097d42344221575))
+* **pi:** add getCoreToolNames and usesPassthrough to pi adapter ([4b969c6](https://github.com/cartwmic/meridian/commit/4b969c65679f84968f8e7c1e62f1e90e0e68cd9e))
+* **pi:** enable passthrough mode and scope PreToolUse hook ([9211817](https://github.com/cartwmic/meridian/commit/92118170f329db20d3b64111f4fd6d68d88402cb))
+
 ## [1.35.0](https://github.com/rynfar/meridian/compare/meridian-v1.34.1...meridian-v1.35.0) (2026-04-10)
 
 
