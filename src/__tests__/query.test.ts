@@ -52,14 +52,14 @@ describe("buildQueryOptions", () => {
     expect(result.options.maxTurns).toBe(2)
   })
 
-  it("sets maxTurns to 3 in passthrough mode with resume (extra turn for session rehydration)", () => {
+  it("sets maxTurns to 5 in passthrough mode with resume (extra headroom for session rehydration and tool chains)", () => {
     const result = buildQueryOptions(makeContext({ passthrough: true, resumeSessionId: "sess-123" }))
-    expect(result.options.maxTurns).toBe(3)
+    expect(result.options.maxTurns).toBe(5)
   })
 
-  it("sets maxTurns to 3 in passthrough mode with deferred tools (extra turn for ToolSearch)", () => {
+  it("sets maxTurns to 5 in passthrough mode with deferred tools (ToolSearch + tool call + final response)", () => {
     const result = buildQueryOptions(makeContext({ passthrough: true, hasDeferredTools: true }))
-    expect(result.options.maxTurns).toBe(3)
+    expect(result.options.maxTurns).toBe(5)
   })
 
   it("includes system prompt as preset in normal mode", () => {
@@ -159,6 +159,16 @@ describe("buildQueryOptions", () => {
     const result = buildQueryOptions(makeContext({ passthrough: false }))
     const env = (result.options as any).env
     expect(env.ENABLE_CLAUDEAI_MCP_SERVERS).toBeUndefined()
+  })
+
+  it("enables strict MCP config in passthrough mode", () => {
+    const result = buildQueryOptions(makeContext({ passthrough: true }))
+    expect((result.options as any).strictMcpConfig).toBe(true)
+  })
+
+  it("does not enable strict MCP config in normal mode", () => {
+    const result = buildQueryOptions(makeContext({ passthrough: false }))
+    expect((result.options as any).strictMcpConfig).toBeUndefined()
   })
 
   it("includes hooks when provided", () => {

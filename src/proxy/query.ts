@@ -111,6 +111,10 @@ export function buildQueryOptions(ctx: QueryContext): BuildQueryResult {
       ...(passthrough
         ? {
             disallowedTools: blockedTools,
+            // Only use the synthetic passthrough MCP server we inject here.
+            // This prevents ambient user/project MCP configs from leaking into
+            // passthrough runs and bypassing Meridian's tool forwarding path.
+            strictMcpConfig: true,
             ...(passthroughMcp ? {
               allowedTools: passthroughMcp.toolNames,
               mcpServers: { [PASSTHROUGH_MCP_NAME]: passthroughMcp.server },
