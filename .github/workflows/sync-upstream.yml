@@ -11,7 +11,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: pi-patches
+          ref: main
           fetch-depth: 0
       - run: |
           git config user.name "github-actions[bot]"
@@ -19,4 +19,4 @@ jobs:
           git remote add upstream https://github.com/rynfar/meridian.git || true
           git fetch upstream main
           git merge upstream/main --no-edit || echo "::warning::Merge conflict — manual resolution needed"
-          git push
+          git push origin main
