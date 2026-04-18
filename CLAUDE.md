@@ -93,9 +93,9 @@ If you need to modify any of these, open an issue first — breaking changes aff
 - Types: feat, fix, refactor, perf, test, docs, chore
 - No AI attribution lines
 
-### Development workflow — NEVER push directly to main
+### Development workflow
 
-All changes go through this process, no exceptions:
+Preferred process for changes:
 
 1. **Create a feature branch** from `main`:
    ```bash
@@ -123,7 +123,6 @@ All changes go through this process, no exceptions:
    gh pr merge <PR_NUMBER> --squash --delete-branch
    ```
 
-6. **Never** run `git push origin main` directly — all code reaches `main` through merged PRs only.
 
 ## Releasing
 
