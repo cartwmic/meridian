@@ -33,7 +33,17 @@ import { createFileChangeHook, extractFileChangesFromMessages, formatFileChangeS
 import { detectTokenAnomalies, formatAnomalyAlerts, type TokenSnapshot } from "./tokenHealth"
 import { computeCacheHitRate, formatUsageSummary } from "./tokenUsage"
 import { sanitizeTextContent } from "./sanitize"
-import { createCacheTrace, summarizeMessages, summarizeQueryOptions, summarizeUsage, digestForTrace, previewForTrace } from "./cacheTrace"
+import {
+  classifyResumeBoundary,
+  createCacheTrace,
+  summarizeMessages,
+  summarizeQueryOptions,
+  summarizeStructuredPromptMessages,
+  summarizeTextPrompt,
+  summarizeUsage,
+  digestForTrace,
+  previewForTrace,
+} from "./cacheTrace"
 import {
   computeLineageHash,
   hashMessage,
@@ -704,10 +714,16 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
         assistantReplayFiltered = isResume && assistantMessagesInDelta > 0
       }
 
+      const promptShapeTrace = structuredMessages
+        ? summarizeStructuredPromptMessages(structuredMessages)
+        : summarizeTextPrompt(textPrompt || "")
+
       cacheTrace.log("resume.delta", {
         lineageType,
         resumePath,
         knownCount,
+        allMessageCount: allMessages.length,
+        resumeSessionId,
         allMessages: summarizeMessages(allMessages),
         messagesToConvert: summarizeMessages(messagesToConvert),
         promptMode: structuredMessages ? "structured" : "text",
@@ -716,6 +732,11 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
         promptTextLines,
         assistantReplayFiltered,
         assistantMessagesFiltered: assistantReplayFiltered ? assistantMessagesInDelta : 0,
+        useStructuredPrompt,
+        hasRequestedPassthroughTools,
+        hasStructuredResumeUserBlocks,
+        hasMultimodal,
+        resumeBoundaryKind: classifyResumeBoundary(messagesToConvert),
       })
 
       // Create a fresh prompt value — can be called multiple times for retry
@@ -896,7 +917,9 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
           promptTextChars,
           promptTextLines,
           assistantReplayFiltered,
+          resumeBoundaryKind: classifyResumeBoundary(messagesToConvert),
           sourceMessages: summarizeMessages(messagesToConvert),
+          ...promptShapeTrace,
         }
 
         function buildTracedQueryOptions(
@@ -1075,7 +1098,19 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                         promptTextChars: hasMultimodal ? 0 : undefined,
                         promptTextLines: hasMultimodal ? 0 : undefined,
                         assistantReplayFiltered: false,
+                        resumeBoundaryKind: "stale_uuid_retry_fresh",
                         sourceMessages: summarizeMessages(allMessages),
+                        ...(hasMultimodal
+                          ? summarizeStructuredPromptMessages(
+                              allMessages
+                                .filter((message: { role: string; content: any }) => message.role === "user")
+                                .map((message: { role: string; content: any }) => ({
+                                  type: "user" as const,
+                                  message: { role: "user" as const, content: stripCacheControl(message.content) },
+                                  parent_tool_use_id: null,
+                                }))
+                            )
+                          : summarizeTextPrompt(buildFreshPrompt(allMessages, stripCacheControl, sanitizeOpts) as string)),
                       },
                     ))
                     return

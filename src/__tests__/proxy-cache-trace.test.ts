@@ -211,12 +211,16 @@ describe("cache trace logging", () => {
     expect(delta.resumePath).toBe("fresh_all")
     expect(delta.promptMode).toBe("text")
     expect(delta.assistantReplayFiltered).toBe(false)
+    expect(delta.resumeBoundaryKind).toBe("other")
+    expect(typeof (delta.allMessages as Record<string, unknown>).digest).toBe("string")
 
     const sdkQuery = findEvent(events, "sdk.query")
     expect(sdkQuery.passthrough).toBe(true)
     expect((sdkQuery.options as Record<string, unknown>).resume).toBeUndefined()
     expect((sdkQuery.options as Record<string, unknown>).maxTurns).toBe(2)
     expect((sdkQuery.prompt as Record<string, unknown>).promptMode).toBe("text")
+    expect(typeof ((sdkQuery.prompt as Record<string, unknown>).promptDigest)).toBe("string")
+    expect(typeof (((sdkQuery.options as Record<string, unknown>).allowedToolDigest))).toBe("string")
 
     const sessionStore = findEvent(events, "session.store")
     expect(sessionStore.decision).toBe("stored")
@@ -279,12 +283,80 @@ describe("cache trace logging", () => {
     expect(delta.resumePath).toBe("resume_delta")
     expect(delta.assistantReplayFiltered).toBe(true)
     expect((delta.messagesToConvert as Record<string, unknown>).count).toBe(2)
+    expect(delta.resumeBoundaryKind).toBe("assistant_text_to_user_text")
+    expect(typeof (delta.messagesToConvert as Record<string, unknown>).digest).toBe("string")
 
     const sdkQuery = findEvent(events, "sdk.query")
     expect((sdkQuery.options as Record<string, unknown>).resume).toBe(MOCK_SDK_SESSION)
     expect((sdkQuery.options as Record<string, unknown>).allowedToolCount).toBe(2)
     expect((sdkQuery.options as Record<string, unknown>).strictMcpConfig).toBe(true)
+    expect(typeof ((sdkQuery.prompt as Record<string, unknown>).promptDigest)).toBe("string")
 
     expect(passthroughServerCreateCount).toBe(2)
+  })
+
+  it("records structured prompt digests and boundary classification for Pi tool_result resumes", async () => {
+    process.env.MERIDIAN_TRACE_CACHE = "1"
+    process.env.MERIDIAN_PASSTHROUGH = "1"
+    const app = createTestApp()
+    const piHeaders = {
+      "x-meridian-agent": "pi",
+      "x-meridian-source": "main",
+    }
+    const piSystem = "Current working directory: /Users/cartwmic/git/meridian"
+
+    const first = await post(app, "trace-pi-structured-1", createBody({
+      system: piSystem,
+      tools: [TOOL_WRITE],
+      messages: [{ role: "user", content: "Create foo.txt with hello" }],
+    }), piHeaders)
+    expect(first.status).toBe(200)
+
+    const second = await post(app, "trace-pi-structured-2", createBody({
+      system: piSystem,
+      tools: [TOOL_WRITE],
+      messages: [
+        { role: "user", content: "Create foo.txt with hello" },
+        {
+          role: "assistant",
+          content: [
+            { type: "text", text: "I'll create the file." },
+            { type: "tool_use", id: "toolu_123", name: "write", input: { path: "foo.txt", content: "hello" } },
+          ],
+        },
+        {
+          role: "user",
+          content: [
+            { type: "tool_result", tool_use_id: "toolu_123", content: "File written." },
+          ],
+        },
+      ],
+    }), piHeaders)
+    expect(second.status).toBe(200)
+
+    const events = readTraceEvents(tmpDir, "trace-pi-structured-2")
+
+    const identity = findEvent(events, "request.identity")
+    expect(identity.adapter).toBe("pi")
+    expect(identity.source).toBe("main")
+    expect(identity.lineageType).toBe("continuation")
+    expect(identity.resumeSessionId).toBe(MOCK_SDK_SESSION)
+
+    const delta = findEvent(events, "resume.delta")
+    expect(delta.promptMode).toBe("structured")
+    expect(delta.useStructuredPrompt).toBe(true)
+    expect(delta.hasStructuredResumeUserBlocks).toBe(true)
+    expect(delta.resumeBoundaryKind).toBe("assistant_tool_use_to_user_tool_result")
+    expect(typeof (delta.messagesToConvert as Record<string, unknown>).digest).toBe("string")
+
+    const sdkQuery = findEvent(events, "sdk.query")
+    const prompt = sdkQuery.prompt as Record<string, unknown>
+    const options = sdkQuery.options as Record<string, unknown>
+    expect(prompt.promptMode).toBe("structured")
+    expect(typeof prompt.promptDigest).toBe("string")
+    expect(Array.isArray(prompt.promptMessageDigests)).toBe(true)
+    expect((prompt.promptMessageDigests as unknown[]).length).toBe(1)
+    expect(typeof options.allowedToolDigest).toBe("string")
+    expect(typeof ((options.systemPrompt as Record<string, unknown>).digest)).toBe("string")
   })
 })

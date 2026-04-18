@@ -38,6 +38,22 @@ export function createCacheTrace(requestId: string): CacheTrace {
   }
 }
 
+function normalizeForTraceDigest(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(normalizeForTraceDigest)
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>)
+        .sort(([a], [b]) => a.localeCompare(b))
+        .map(([key, nested]) => [key, normalizeForTraceDigest(nested)])
+    )
+  }
+  return value
+}
+
+export function digestValueForTrace(value: unknown): string {
+  return digestForTrace(JSON.stringify(normalizeForTraceDigest(value)))
+}
+
 export function summarizeMessages(messages: Array<{ role: string; content: unknown }>): Record<string, unknown> {
   const roleCounts: Record<string, number> = {}
   const blockTypeCounts: Record<string, number> = {}
@@ -92,13 +108,64 @@ export function summarizeMessages(messages: Array<{ role: string; content: unkno
   })
 
   return {
+    digest: digestValueForTrace(messages),
     count: messages.length,
     roleCounts,
+    roleSequence: messages.slice(0, 16).map(message => message.role),
     blockTypeCounts,
     textChars,
     toolNames: [...new Set(toolNames)].slice(0, 8),
     sample,
   }
+}
+
+export function summarizeTextPrompt(text: string): Record<string, unknown> {
+  return {
+    promptDigest: digestForTrace(text),
+    promptChars: text.length,
+    promptLines: text ? text.split("\n").length : 0,
+  }
+}
+
+export function summarizeStructuredPromptMessages(
+  messages: Array<{ type: "user"; message: { role: string; content: unknown }; parent_tool_use_id: string | null }>
+): Record<string, unknown> {
+  const normalizedMessages = messages.map((message) => ({
+    role: message.message.role,
+    content: message.message.content,
+    parent_tool_use_id: message.parent_tool_use_id,
+  }))
+  const promptMessages = normalizedMessages.map(({ role, content }) => ({ role, content }))
+
+  return {
+    promptDigest: digestValueForTrace(normalizedMessages),
+    promptMessageDigests: normalizedMessages.map(message => digestValueForTrace(message)),
+    promptMessages: summarizeMessages(promptMessages),
+    parentToolUseCount: normalizedMessages.filter(message => message.parent_tool_use_id != null).length,
+  }
+}
+
+export function classifyResumeBoundary(messages: Array<{ role: string; content: unknown }>): string {
+  const hasBlockType = (role: string, type: string): boolean => messages.some((message) =>
+    message.role === role
+    && Array.isArray(message.content)
+    && message.content.some((block: unknown) => !!block && typeof block === "object" && (block as { type?: unknown }).type === type)
+  )
+
+  const hasAssistantToolUse = hasBlockType("assistant", "tool_use")
+  const hasAssistantText = hasBlockType("assistant", "text")
+  const hasUserToolResult = hasBlockType("user", "tool_result")
+  const hasUserNonTextBlock = messages.some((message) =>
+    message.role === "user"
+    && Array.isArray(message.content)
+    && message.content.some((block: unknown) => !!block && typeof block === "object" && (block as { type?: unknown }).type !== "text")
+  )
+
+  if (hasAssistantToolUse && hasUserToolResult) return "assistant_tool_use_to_user_tool_result"
+  if (hasUserToolResult) return "user_tool_result"
+  if (hasAssistantText && hasUserNonTextBlock) return "assistant_text_to_user_structured"
+  if (hasAssistantText) return "assistant_text_to_user_text"
+  return "other"
 }
 
 export function summarizeQueryOptions(options: Record<string, unknown>): Record<string, unknown> {
@@ -123,8 +190,12 @@ export function summarizeQueryOptions(options: Record<string, unknown>): Record<
     includePartialMessages: options.includePartialMessages === true,
     strictMcpConfig: options.strictMcpConfig === true,
     allowedToolCount: allowedTools.length,
+    allowedToolNames: allowedTools.slice(0, 16),
+    allowedToolDigest: digestValueForTrace(allowedTools),
     disallowedToolCount: disallowedTools.length,
+    disallowedToolDigest: digestValueForTrace(disallowedTools),
     mcpServerNames: mcpServers,
+    mcpServerDigest: digestValueForTrace(mcpServers),
     hasHooks: !!(options.hooks && typeof options.hooks === "object" && Object.keys(options.hooks as Record<string, unknown>).length > 0),
     thinkingType: typeof thinking?.type === "string" ? thinking.type : undefined,
     taskBudgetTotal: typeof taskBudget?.total === "number" ? taskBudget.total : undefined,
@@ -132,7 +203,11 @@ export function summarizeQueryOptions(options: Record<string, unknown>): Record<
     additionalDirectoriesCount: Array.isArray(options.additionalDirectories) ? options.additionalDirectories.length : 0,
     systemPrompt:
       typeof systemPrompt === "string"
-        ? { kind: "text", chars: systemPrompt.length }
+        ? {
+            kind: "text",
+            chars: systemPrompt.length,
+            digest: digestForTrace(systemPrompt),
+          }
         : systemPrompt && typeof systemPrompt === "object"
           ? {
               kind: "preset",
@@ -140,6 +215,12 @@ export function summarizeQueryOptions(options: Record<string, unknown>): Record<
                 ? (systemPrompt as { preset?: string }).preset
                 : undefined,
               hasAppend: typeof (systemPrompt as { append?: unknown }).append === "string",
+              appendChars: typeof (systemPrompt as { append?: unknown }).append === "string"
+                ? ((systemPrompt as { append: string }).append.length)
+                : 0,
+              appendDigest: typeof (systemPrompt as { append?: unknown }).append === "string"
+                ? digestForTrace((systemPrompt as { append: string }).append)
+                : undefined,
             }
           : undefined,
   }
