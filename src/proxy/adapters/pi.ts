@@ -121,8 +121,8 @@ export const piAdapter: AgentAdapter = {
    * Core tools that should always be loaded (never deferred).
    * When pi sends more tools than the defer threshold (e.g. MCP tools from
    * basic-memory, playwright, etc.), non-core tools are auto-deferred.
-   * This ensures hasDeferredTools=true, which sets maxTurns=3 instead of 2,
-   * giving the SDK enough turns to complete a tool roundtrip.
+   * This ensures hasDeferredTools=true, which raises maxTurns above the
+   * 2-turn baseline so the SDK can complete deferred ToolSearch + tool flows.
    */
   getCoreToolNames(): readonly string[] {
     return ["read", "write", "edit", "bash", "glob", "grep"]

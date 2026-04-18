@@ -369,7 +369,7 @@ describe("PreToolUse hook: passthrough ToolSearch", () => {
     expect((result as any).decision).toBeUndefined()
   })
 
-  it("still blocks non-ToolSearch tools for client-side execution", async () => {
+  it("still blocks passthrough MCP tools for client-side execution", async () => {
     const app = createTestApp()
     await (await post(app, {
       model: "claude-sonnet-4-5",
@@ -383,7 +383,7 @@ describe("PreToolUse hook: passthrough ToolSearch", () => {
 
     const result = await hookFn({
       hook_event_name: "PreToolUse",
-      tool_name: "Read",
+      tool_name: "mcp__oc__read",
       tool_input: { file_path: "/tmp/test.txt" },
       tool_use_id: "toolu_read",
     }, undefined, { signal: new AbortController().signal })
