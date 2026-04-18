@@ -28,6 +28,15 @@ let queryCallCount = 0
 
 // Simulate SDK returning a session_id in messages
 const MOCK_SDK_SESSION = "sdk-session-abc123"
+const PASSTHROUGH_READ_TOOL = {
+  name: "read",
+  description: "Read a file",
+  input_schema: {
+    type: "object",
+    properties: { path: { type: "string" } },
+    required: ["path"],
+  },
+}
 
 mock.module("@anthropic-ai/claude-agent-sdk", () => ({
   query: (params: any) => {
@@ -43,7 +52,9 @@ mock.module("@anthropic-ai/claude-agent-sdk", () => ({
   createSdkMcpServer: () => ({
     type: "sdk",
     name: "test",
-    instance: {},
+    instance: {
+      registerTool: () => ({}),
+    },
   }),
   tool: () => ({}),
 }))
@@ -86,6 +97,12 @@ async function readStreamFull(response: Response): Promise<string> {
     result += decoder.decode(value, { stream: true })
   }
   return result
+}
+
+async function readPromptMessages(prompt: AsyncIterable<any>): Promise<any[]> {
+  const messages: any[] = []
+  for await (const msg of prompt) messages.push(msg)
+  return messages
 }
 
 // ============================================================
@@ -316,6 +333,160 @@ describe("Session resume: only send last user message on resume", () => {
     // The prompt should only contain the last user message, not the full history
     expect(capturedQueryParams.prompt).toContain("Second message - this is the new one")
     expect(capturedQueryParams.prompt).not.toContain("First message")
+    expect(capturedQueryParams.prompt).not.toContain("Hello")
+  })
+
+  it("should not replay a prior assistant tool_use on resumed tool_result turns", async () => {
+    const app = createTestApp()
+
+    await (await post(app, {
+      model: "claude-sonnet-4-5",
+      max_tokens: 1024,
+      stream: false,
+      messages: [{ role: "user", content: "Create foo.txt with hello" }],
+    }, { "x-opencode-session": "oc-tool-resume" })).json()
+
+    mockMessages = [
+      assistantMessage([{ type: "text", text: "Done" }]),
+    ]
+
+    await (await post(app, {
+      model: "claude-sonnet-4-5",
+      max_tokens: 1024,
+      stream: false,
+      messages: [
+        { role: "user", content: "Create foo.txt with hello" },
+        {
+          role: "assistant",
+          content: [
+            { type: "text", text: "I'll create the file." },
+            { type: "tool_use", id: "toolu_123", name: "write", input: { path: "foo.txt", content: "hello" } },
+          ],
+        },
+        {
+          role: "user",
+          content: [
+            { type: "tool_result", tool_use_id: "toolu_123", content: "File written." },
+          ],
+        },
+      ],
+    }, { "x-opencode-session": "oc-tool-resume" })).json()
+
+    expect(capturedQueryParams.options.resume).toBe(MOCK_SDK_SESSION)
+    expect(capturedQueryParams.prompt).toContain("[Tool Result for toolu_123: File written.]")
+    expect(capturedQueryParams.prompt).not.toContain("[Tool Use: write({\"path\":\"foo.txt\",\"content\":\"hello\"})]")
+    expect(capturedQueryParams.prompt).not.toContain("I'll create the file.")
+  })
+
+  it("should not replay prior assistant tool_use on fingerprint-based Pi resumes", async () => {
+    const app = createTestApp()
+    const piHeaders = { "x-meridian-agent": "pi" }
+    const piSystem = "Current working directory: /Users/cartwmic/git/meridian"
+
+    await (await post(app, {
+      model: "claude-sonnet-4-5",
+      max_tokens: 1024,
+      stream: false,
+      system: piSystem,
+      messages: [{ role: "user", content: "Create foo.txt with hello" }],
+    }, piHeaders)).json()
+
+    mockMessages = [
+      assistantMessage([{ type: "text", text: "Done" }]),
+    ]
+
+    await (await post(app, {
+      model: "claude-sonnet-4-5",
+      max_tokens: 1024,
+      stream: false,
+      system: piSystem,
+      messages: [
+        { role: "user", content: "Create foo.txt with hello" },
+        {
+          role: "assistant",
+          content: [
+            { type: "text", text: "I'll create the file." },
+            { type: "tool_use", id: "toolu_123", name: "write", input: { path: "foo.txt", content: "hello" } },
+          ],
+        },
+        {
+          role: "user",
+          content: [
+            { type: "tool_result", tool_use_id: "toolu_123", content: "File written." },
+          ],
+        },
+      ],
+    }, piHeaders)).json()
+
+    expect(capturedQueryParams.options.resume).toBe(MOCK_SDK_SESSION)
+    expect(capturedQueryParams.prompt).toContain("[Tool Result for toolu_123: File written.]")
+    expect(capturedQueryParams.prompt).not.toContain("[Tool Use: write({\"path\":\"foo.txt\",\"content\":\"hello\"})]")
+    expect(capturedQueryParams.prompt).not.toContain("I'll create the file.")
+  })
+
+  it("preserves tool_result blocks as structured messages on resumed Pi passthrough turns", async () => {
+    const app = createTestApp()
+    const piHeaders = { "x-meridian-agent": "pi" }
+    const piSystem = "Current working directory: /Users/cartwmic/git/meridian"
+    const previousPassthrough = process.env.MERIDIAN_PASSTHROUGH
+    process.env.MERIDIAN_PASSTHROUGH = "1"
+
+    try {
+      await (await post(app, {
+        model: "claude-sonnet-4-5",
+        max_tokens: 1024,
+        stream: false,
+        system: piSystem,
+        messages: [{ role: "user", content: "Create foo.txt with hello" }],
+        tools: [PASSTHROUGH_READ_TOOL],
+      }, piHeaders)).json()
+
+      mockMessages = [assistantMessage([{ type: "text", text: "Done" }])]
+
+      await (await post(app, {
+        model: "claude-sonnet-4-5",
+        max_tokens: 1024,
+        stream: false,
+        system: piSystem,
+        messages: [
+          { role: "user", content: "Create foo.txt with hello" },
+          {
+            role: "assistant",
+            content: [
+              { type: "text", text: "I'll create the file." },
+              { type: "tool_use", id: "toolu_123", name: "write", input: { path: "foo.txt", content: "hello" } },
+            ],
+          },
+          {
+            role: "user",
+            content: [
+              { type: "tool_result", tool_use_id: "toolu_123", content: "File written." },
+            ],
+          },
+        ],
+        tools: [PASSTHROUGH_READ_TOOL],
+      }, piHeaders)).json()
+
+      expect(capturedQueryParams.options.resume).toBe(MOCK_SDK_SESSION)
+      expect(typeof capturedQueryParams.prompt).not.toBe("string")
+
+      const promptMessages = await readPromptMessages(capturedQueryParams.prompt)
+      expect(promptMessages).toEqual([
+        {
+          type: "user",
+          message: {
+            role: "user",
+            content: [
+              { type: "tool_result", tool_use_id: "toolu_123", content: "File written." },
+            ],
+          },
+          parent_tool_use_id: null,
+        },
+      ])
+    } finally {
+      if (previousPassthrough === undefined) delete process.env.MERIDIAN_PASSTHROUGH
+      else process.env.MERIDIAN_PASSTHROUGH = previousPassthrough
+    }
   })
 
   it("should resume in streaming mode too", async () => {
@@ -354,6 +525,56 @@ describe("Session resume: only send last user message on resume", () => {
     expect(capturedQueryParams.options.resume).toBe(MOCK_SDK_SESSION)
     expect(capturedQueryParams.prompt).toContain("Continue please")
     expect(capturedQueryParams.prompt).not.toContain("Start conversation")
+    expect(capturedQueryParams.prompt).not.toContain("Hello")
+  })
+
+  it("should not replay prior assistant tool_use on resumed tool_result turns in streaming mode", async () => {
+    const app = createTestApp()
+
+    await (await post(app, {
+      model: "claude-sonnet-4-5",
+      max_tokens: 1024,
+      stream: false,
+      messages: [{ role: "user", content: "Create foo.txt with hello" }],
+    }, { "x-opencode-session": "oc-stream-tool-resume" })).json()
+
+    mockMessages = [
+      messageStart(),
+      textBlockStart(0),
+      textDelta(0, "Done"),
+      blockStop(0),
+      messageDelta("end_turn"),
+      messageStop(),
+    ]
+
+    const response = await post(app, {
+      model: "claude-sonnet-4-5",
+      max_tokens: 1024,
+      stream: true,
+      messages: [
+        { role: "user", content: "Create foo.txt with hello" },
+        {
+          role: "assistant",
+          content: [
+            { type: "text", text: "I'll create the file." },
+            { type: "tool_use", id: "toolu_123", name: "write", input: { path: "foo.txt", content: "hello" } },
+          ],
+        },
+        {
+          role: "user",
+          content: [
+            { type: "tool_result", tool_use_id: "toolu_123", content: "File written." },
+          ],
+        },
+      ],
+    }, { "x-opencode-session": "oc-stream-tool-resume" })
+
+    await readStreamFull(response)
+
+    expect(capturedQueryParams.options.resume).toBe(MOCK_SDK_SESSION)
+    expect(capturedQueryParams.prompt).toContain("[Tool Result for toolu_123: File written.]")
+    expect(capturedQueryParams.prompt).not.toContain("[Tool Use: write({\"path\":\"foo.txt\",\"content\":\"hello\"})]")
+    expect(capturedQueryParams.prompt).not.toContain("I'll create the file.")
   })
 
   it("should send full history on first request (no resume)", async () => {

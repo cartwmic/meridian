@@ -33,6 +33,7 @@ import { createFileChangeHook, extractFileChangesFromMessages, formatFileChangeS
 import { detectTokenAnomalies, formatAnomalyAlerts, type TokenSnapshot } from "./tokenHealth"
 import { computeCacheHitRate, formatUsageSummary } from "./tokenUsage"
 import { sanitizeTextContent } from "./sanitize"
+import { createCacheTrace, summarizeMessages, summarizeQueryOptions, summarizeUsage, digestForTrace, previewForTrace } from "./cacheTrace"
 import {
   computeLineageHash,
   hashMessage,
@@ -43,6 +44,7 @@ import {
 // Re-export for backwards compatibility (existing tests import from here)
 
 import { lookupSession, storeSession, clearSessionCache, getMaxSessionsLimit, evictSession, getSessionByClaudeId } from "./session/cache"
+import { getConversationFingerprint } from "./session/fingerprint"
 import { lookupSessionRecovery, listStoredSessions } from "./sessionStore"
 // Re-export for backwards compatibility (existing tests import from here)
 export { computeLineageHash, hashMessage, computeMessageHashes }
@@ -207,11 +209,13 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
   // Cache last-seen tool definitions per agent session to prevent prompt cache
   // invalidation when clients intermittently omit tools on continuation requests.
   const sessionToolCache = new Map<string, any[]>()
-  // Cache the passthrough MCP server per session. Reusing the same server
-  // across turns (when the tool set is unchanged) avoids subtle prompt-cache
-  // invalidation from MCP server re-creation. Key hashes tool name + schema
-  // so silently-updated tool definitions force a rebuild.
-  const sessionMcpCache = new LRUMap<string, { key: string; mcp: ReturnType<typeof createPassthroughMcpServer> }>(getMaxSessionsLimit())
+  // Cache only the last-seen passthrough tool-set signature per session.
+  // The SDK MCP server object itself must stay per-request: SDK/MCP protocol
+  // layers reject reconnecting the same server instance to a second transport
+  // with "Already connected to a transport". We still keep the stable tool-set
+  // signature so cache tracing can distinguish same-tool continuations from
+  // real tool-set changes.
+  const sessionMcpCache = new LRUMap<string, { key: string }>(getMaxSessionsLimit())
 
   const app = new Hono()
 
@@ -286,6 +290,11 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
             { type: "error", error: { type: "invalid_request_error", message: "messages: Field required" } },
             400
           )
+        }
+
+        const cacheTrace = createCacheTrace(requestMeta.requestId)
+        if (cacheTrace.enabled && cacheTrace.path) {
+          console.error(`[PROXY] ${requestMeta.requestId} cache_trace=${cacheTrace.path}`)
         }
 
         // Resolve profile: header > active > default > first configured
@@ -424,6 +433,10 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
         // unaffected — behavior is byte-identical to today.
         const isIndependentSession =
           requestSource?.startsWith("fork-") || requestSource?.startsWith("subagent-") || false
+        const passthroughSessionCacheKey = profileSessionId
+          ?? (!isIndependentSession
+            ? getConversationFingerprint(body.messages || [], profileScopedCwd) || undefined
+            : undefined)
         let lineageResult = isIndependentSession
           ? { type: "diverged" as const }
           : lookupSession(profileSessionId, body.messages || [], profileScopedCwd)
@@ -456,6 +469,25 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
         const requestLogLine = `${requestMeta.requestId} adapter=${adapter.name}${requestSource ? ` source=${requestSource}` : ""} model=${model} stream=${stream} tools=${toolCount} lineage=${lineageType} session=${resumeSessionId?.slice(0, 8) || "new"}${isUndo && undoRollbackUuid ? ` rollback=${undoRollbackUuid.slice(0, 8)}` : ""}${agentMode ? ` agent=${agentMode}` : ""} active=${activeSessions}/${MAX_CONCURRENT_SESSIONS} msgCount=${msgCount}`
         console.error(`[PROXY] ${requestLogLine} msgs=${msgSummary}`)
         diagnosticLog.session(`${requestLogLine}`, requestMeta.requestId)
+        cacheTrace.log("request.identity", {
+          adapter: adapter.name,
+          source: requestSource,
+          profileId: profile.id,
+          agentMode,
+          model,
+          stream,
+          lineageType,
+          lookupMode: profileSessionId ? "session" : (isIndependentSession ? "independent" : "fingerprint"),
+          isIndependentSession,
+          sessionId: agentSessionId,
+          scopedSessionId: profileSessionId,
+          resumeSessionId,
+          rollbackUuid: undoRollbackUuid,
+          passthroughCacheKey: passthroughSessionCacheKey,
+          messageCount: msgCount,
+          toolCount,
+          allMessages: summarizeMessages(body.messages || []),
+        })
 
         // Recovery logging: when a session diverges, check if the store has a
         // previous session ID that the user can recover via `claude --resume`.
@@ -496,33 +528,57 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
       // When resuming, only send new messages the SDK doesn't have.
       const allMessages = body.messages || []
       let messagesToConvert: typeof allMessages
+      let knownCount = 0
+      let resumePath = "fresh_all"
 
       if ((isResume || isUndo) && cachedSession) {
         if (isUndo && undoRollbackUuid) {
           // Undo with SDK rollback: the SDK will fork to the correct point,
           // so we only need to send the new user message.
           messagesToConvert = getLastUserMessage(allMessages)
+          resumePath = "undo_last_user"
         } else if (isResume) {
-          const knownCount = cachedSession.messageCount || 0
+          knownCount = cachedSession.messageCount || 0
           if (knownCount > 0 && knownCount < allMessages.length) {
             messagesToConvert = allMessages.slice(knownCount)
+            resumePath = "resume_delta"
           } else {
             messagesToConvert = getLastUserMessage(allMessages)
+            resumePath = "resume_last_user"
           }
         } else {
           // Undo without UUID (legacy session) — fall back to last user message
           // to avoid the catastrophic flat text replay.
           messagesToConvert = getLastUserMessage(allMessages)
+          resumePath = "undo_legacy_last_user"
         }
       } else {
         messagesToConvert = allMessages
       }
+
+      const assistantMessagesInDelta = messagesToConvert.filter((m: { role: string }) => m.role === "assistant").length
+
+      // --- Passthrough mode ---
+      // When enabled, ALL tool execution is forwarded to OpenCode instead of
+      // being handled internally. This enables multi-model agent delegation
+      // (e.g., oracle on GPT-5.2, explore on Gemini via oh-my-opencode).
+      // Adapter can override the global passthrough env var per-agent.
+      // Droid always uses internal mode; OpenCode defers to the env var.
+      const adapterPassthrough = adapter.usesPassthrough?.()
+      const passthrough = adapterPassthrough !== undefined
+        ? adapterPassthrough
+        : envBool("PASSTHROUGH")
 
       // Check if any messages contain multimodal content (images, documents, files)
       const MULTIMODAL_TYPES = new Set(["image", "document", "file"])
       const hasMultimodal = messagesToConvert?.some((m: any) =>
         Array.isArray(m.content) && m.content.some((b: any) => MULTIMODAL_TYPES.has(b.type))
       )
+      const hasRequestedPassthroughTools = passthrough && Array.isArray(body.tools) && body.tools.length > 0
+      const hasStructuredResumeUserBlocks = !!(isResume && hasRequestedPassthroughTools && messagesToConvert?.some((m: any) =>
+        m.role === "user" && Array.isArray(m.content) && m.content.some((b: any) => b?.type && b.type !== "text")
+      ))
+      const useStructuredPrompt = hasMultimodal || hasStructuredResumeUserBlocks
 
       // Strip cache_control from content blocks — the SDK manages its own caching
       // and OpenCode's ttl='1h' blocks conflict with the SDK's ttl='5m' blocks
@@ -541,8 +597,12 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
       // Structured prompts are stored as arrays so they can be replayed on retry.
       let structuredMessages: Array<{ type: "user"; message: { role: string; content: any }; parent_tool_use_id: null }> | undefined
       let textPrompt: string | undefined
+      let promptInputMessages = 0
+      let promptTextChars = 0
+      let promptTextLines = 0
+      let assistantReplayFiltered = false
 
-      if (hasMultimodal) {
+      if (useStructuredPrompt) {
         // Structured messages preserve image/document/file blocks for Claude to see.
         // On resume, only send user messages (SDK has assistant context already).
         // On first request, include everything.
@@ -593,12 +653,19 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
         }
       } else {
         // Text prompt — convert messages to string.
+        // On resume, only send new user messages from the delta.
+        // The SDK session already contains prior assistant context, so
+        // replaying assistant turns here duplicates tool_use/text content
+        // into the resumed prompt and can shift prompt-cache boundaries.
+        const textMessages = isResume
+          ? messagesToConvert?.filter((m: { role: string }) => m.role === "user")
+          : messagesToConvert
         // Sanitize each text block before flattening to strip orchestration
         // wrappers (<env>, <task_metadata>, etc.) that harnesses inject.
         // `<system-reminder>` is only stripped for adapters that leak CWD
         // through it (Droid) — preserved otherwise so that harness state
         // like oh-my-opencode's background-task IDs reaches the model.
-        textPrompt = messagesToConvert
+        textPrompt = textMessages
           ?.map((m: { role: string; content: string | Array<{ type: string; text?: string; content?: string; tool_use_id?: string; name?: string; input?: unknown; id?: string }> }) => {
             const role = m.role === "assistant" ? "Assistant" : "Human"
             let content: string
@@ -625,6 +692,32 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
           .join("\n\n") || ""
       }
 
+      if (structuredMessages) {
+        promptInputMessages = structuredMessages.length
+        assistantReplayFiltered = isResume && assistantMessagesInDelta > 0
+      } else {
+        promptTextChars = textPrompt?.length || 0
+        promptTextLines = textPrompt ? textPrompt.split("\n").length : 0
+        promptInputMessages = isResume
+          ? messagesToConvert.filter((m: { role: string }) => m.role === "user").length
+          : messagesToConvert.length
+        assistantReplayFiltered = isResume && assistantMessagesInDelta > 0
+      }
+
+      cacheTrace.log("resume.delta", {
+        lineageType,
+        resumePath,
+        knownCount,
+        allMessages: summarizeMessages(allMessages),
+        messagesToConvert: summarizeMessages(messagesToConvert),
+        promptMode: structuredMessages ? "structured" : "text",
+        promptInputMessages,
+        promptTextChars,
+        promptTextLines,
+        assistantReplayFiltered,
+        assistantMessagesFiltered: assistantReplayFiltered ? assistantMessagesInDelta : 0,
+      })
+
       // Create a fresh prompt value — can be called multiple times for retry
       function makePrompt(): string | AsyncIterable<any> {
         if (structuredMessages) {
@@ -634,16 +727,6 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
         return textPrompt!
       }
 
-      // --- Passthrough mode ---
-      // When enabled, ALL tool execution is forwarded to OpenCode instead of
-      // being handled internally. This enables multi-model agent delegation
-      // (e.g., oracle on GPT-5.2, explore on Gemini via oh-my-opencode).
-      // Adapter can override the global passthrough env var per-agent.
-      // Droid always uses internal mode; OpenCode defers to the env var.
-      const adapterPassthrough = adapter.usesPassthrough?.()
-      const passthrough = adapterPassthrough !== undefined
-        ? adapterPassthrough
-        : envBool("PASSTHROUGH")
       // SDK setting sources — controls CLAUDE.md and user settings loading.
       const settingSources: import("@anthropic-ai/claude-agent-sdk").SettingSource[] =
         envBool("LOAD_CONTEXT") || sdkFeatures.claudeMd === "full"
@@ -661,29 +744,85 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
       // previously sent them, reuse the cached set to preserve prompt cache.
       let passthroughMcp: ReturnType<typeof createPassthroughMcpServer> | undefined
       let requestTools = Array.isArray(body.tools) ? body.tools : []
-      if (passthrough && requestTools.length === 0 && profileSessionId) {
-        const cached = sessionToolCache.get(profileSessionId)
+      const restoreToolCacheKey = passthroughSessionCacheKey && cachedSession
+        ? passthroughSessionCacheKey
+        : undefined
+      let toolCacheEvent: Record<string, unknown> = {
+        decision: "skipped",
+        reason: passthrough ? "no_restore_needed" : "passthrough_disabled",
+        requestedToolCount: toolCount,
+        effectiveToolCount: requestTools.length,
+        restoreKey: restoreToolCacheKey,
+      }
+      if (passthrough && requestTools.length === 0 && restoreToolCacheKey) {
+        const cached = sessionToolCache.get(restoreToolCacheKey)
         if (cached && cached.length > 0) {
           requestTools = cached
           console.error(`[PROXY] ${requestMeta.requestId} tools_restored: client sent 0 tools but session had ${cached.length} — reusing cached tools to preserve prompt cache`)
+          toolCacheEvent = {
+            decision: "restored",
+            reason: "client_omitted_tools",
+            requestedToolCount: toolCount,
+            effectiveToolCount: requestTools.length,
+            cachedToolCount: cached.length,
+            restoreKey: restoreToolCacheKey,
+          }
+        } else {
+          toolCacheEvent = {
+            decision: "miss",
+            reason: "no_cached_tools_for_resume",
+            requestedToolCount: toolCount,
+            effectiveToolCount: requestTools.length,
+            restoreKey: restoreToolCacheKey,
+          }
         }
+      } else if (passthrough && requestTools.length > 0) {
+        toolCacheEvent = {
+          decision: "client_supplied",
+          reason: "request_included_tools",
+          requestedToolCount: toolCount,
+          effectiveToolCount: requestTools.length,
+          restoreKey: restoreToolCacheKey,
+        }
+      }
+      cacheTrace.log("cache.tools", toolCacheEvent)
+
+      let mcpCacheEvent: Record<string, unknown> = {
+        decision: "skipped",
+        reason: passthrough ? (requestTools.length === 0 ? "no_tools_available" : "not_initialized") : "passthrough_disabled",
+        passthroughCacheKey: passthroughSessionCacheKey,
+        toolCount: requestTools.length,
       }
       if (passthrough && requestTools.length > 0) {
         const toolSetKey = computeToolSetKey(requestTools)
-        const cachedMcp = profileSessionId ? sessionMcpCache.get(profileSessionId) : undefined
-        if (cachedMcp && cachedMcp.key === toolSetKey) {
-          passthroughMcp = cachedMcp.mcp
-        } else {
-          passthroughMcp = createPassthroughMcpServer(requestTools, adapter.getCoreToolNames?.())
-          if (profileSessionId) {
-            sessionMcpCache.set(profileSessionId, { key: toolSetKey, mcp: passthroughMcp })
-            if (cachedMcp) {
-              console.error(`[PROXY] ${requestMeta.requestId} tools_changed: MCP server recreated (prompt cache likely invalidates)`)
-            }
+        const toolSetKeySha256 = digestForTrace(toolSetKey)
+        const cachedMcp = passthroughSessionCacheKey ? sessionMcpCache.get(passthroughSessionCacheKey) : undefined
+        const toolSetMatched = cachedMcp?.key === toolSetKey
+
+        // Always create a fresh SDK MCP server per request. Reusing the same
+        // instance across resumed turns fails in SDK >= 0.2.90 because the MCP
+        // protocol refuses reconnecting an already-attached transport.
+        passthroughMcp = createPassthroughMcpServer(requestTools, adapter.getCoreToolNames?.())
+
+        mcpCacheEvent = {
+          decision: toolSetMatched ? "reused" : (cachedMcp ? "recreated" : "created"),
+          reason: toolSetMatched ? "tool_set_match" : (cachedMcp ? "tool_set_changed" : "no_cached_mcp_server"),
+          passthroughCacheKey: passthroughSessionCacheKey,
+          toolCount: requestTools.length,
+          toolNames: requestTools.map((tool: { name: string }) => tool.name),
+          toolSetKeyPreview: previewForTrace(toolSetKey),
+          toolSetKeySha256,
+        }
+
+        if (passthroughSessionCacheKey) {
+          sessionMcpCache.set(passthroughSessionCacheKey, { key: toolSetKey })
+          if (cachedMcp && !toolSetMatched) {
+            console.error(`[PROXY] ${requestMeta.requestId} tools_changed: MCP server recreated (prompt cache likely invalidates)`)
           }
         }
-        if (profileSessionId) sessionToolCache.set(profileSessionId, requestTools)
+        if (passthroughSessionCacheKey) sessionToolCache.set(passthroughSessionCacheKey, requestTools)
       }
+      cacheTrace.log("cache.mcp", mcpCacheEvent)
       const hasDeferredTools = passthroughMcp?.hasDeferredTools ?? false
       // Count deferred tools: when auto-defer is active, non-core tools are deferred
       const coreNames = adapter.getCoreToolNames?.()
@@ -748,6 +887,103 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
           stderrLines.push(data.trimEnd())
           claudeLog("subprocess.stderr", { line: data.trimEnd() })
         }
+        const additionalDirectories = sdkFeatures.additionalDirectories
+          ? sdkFeatures.additionalDirectories.split(",").map(d => d.trim()).filter(Boolean)
+          : undefined
+        const initialPromptTrace = {
+          promptMode: structuredMessages ? "structured" : "text",
+          promptInputMessages,
+          promptTextChars,
+          promptTextLines,
+          assistantReplayFiltered,
+          sourceMessages: summarizeMessages(messagesToConvert),
+        }
+
+        function buildTracedQueryOptions(
+          label: string,
+          mode: "stream" | "non_stream",
+          prompt: QueryContext["prompt"],
+          streamMode: boolean,
+          overrides?: { resumeSessionId?: string; isUndo?: boolean; undoRollbackUuid?: string },
+          promptTrace: Record<string, unknown> = initialPromptTrace,
+        ) {
+          const result = buildQueryOptions({
+            prompt,
+            model,
+            workingDirectory,
+            systemContext,
+            claudeExecutable,
+            passthrough,
+            stream: streamMode,
+            sdkAgents,
+            passthroughMcp,
+            cleanEnv: profileEnv,
+            hasDeferredTools,
+            resumeSessionId: overrides?.resumeSessionId,
+            isUndo: overrides?.isUndo ?? false,
+            undoRollbackUuid: overrides?.undoRollbackUuid,
+            sdkHooks,
+            adapter,
+            onStderr,
+            effort,
+            thinking,
+            taskBudget,
+            betas,
+            settingSources,
+            codeSystemPrompt: sdkFeatures.codeSystemPrompt ? true : undefined,
+            clientSystemPrompt: sdkFeatures.clientSystemPrompt === false ? false : undefined,
+            memory: sdkFeatures.memory,
+            dreaming: sdkFeatures.dreaming,
+            sharedMemory: sdkFeatures.sharedMemory,
+            maxBudgetUsd: sdkFeatures.maxBudgetUsd,
+            fallbackModel: sdkFeatures.fallbackModel,
+            sdkDebug: sdkFeatures.sdkDebug,
+            additionalDirectories,
+          })
+          cacheTrace.log("sdk.query", {
+            label,
+            mode,
+            model,
+            passthrough,
+            hasDeferredTools,
+            deferredToolCount,
+            passthroughToolCount: passthroughMcp?.toolNames.length ?? 0,
+            prompt: promptTrace,
+            options: summarizeQueryOptions(result.options as unknown as Record<string, unknown>),
+          })
+          return result
+        }
+
+        function persistSessionWithTrace(
+          mode: "stream" | "non_stream",
+          claudeSessionId: string | undefined,
+          sdkUuidMap: Array<string | null>,
+          usage: TokenUsage | undefined,
+        ): void {
+          const keyType = profileSessionId ? "session" : "fingerprint"
+          if (claudeSessionId && !isIndependentSession) {
+            storeSession(profileSessionId, body.messages || [], claudeSessionId, profileScopedCwd, sdkUuidMap, usage)
+            cacheTrace.log("session.store", {
+              mode,
+              decision: "stored",
+              keyType,
+              key: passthroughSessionCacheKey,
+              claudeSessionId,
+              messageCount: allMessages.length,
+              sdkUuidCount: sdkUuidMap.filter(Boolean).length,
+              usage: summarizeUsage(usage),
+            })
+          } else {
+            cacheTrace.log("session.store", {
+              mode,
+              decision: "skipped",
+              reason: claudeSessionId ? "independent_session" : "missing_sdk_session_id",
+              keyType,
+              key: passthroughSessionCacheKey,
+              messageCount: allMessages.length,
+            })
+          }
+        }
 
         if (!stream) {
           const contentBlocks: Array<Record<string, unknown>> = []
@@ -794,19 +1030,13 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                 // only "assistant" messages represent actual response content.
                 let didYieldContent = false
                 try {
-                  for await (const event of query(buildQueryOptions({
-                    prompt: makePrompt(), model, workingDirectory, systemContext, claudeExecutable,
-                    passthrough, stream: false, sdkAgents, passthroughMcp, cleanEnv: profileEnv, hasDeferredTools,
-                    resumeSessionId, isUndo, undoRollbackUuid, sdkHooks, adapter, onStderr,
-                    effort, thinking, taskBudget, betas, settingSources,
-                    codeSystemPrompt: sdkFeatures.codeSystemPrompt ? true : undefined, clientSystemPrompt: sdkFeatures.clientSystemPrompt === false ? false : undefined,
-                    memory: sdkFeatures.memory, dreaming: sdkFeatures.dreaming, sharedMemory: sdkFeatures.sharedMemory,
-                    maxBudgetUsd: sdkFeatures.maxBudgetUsd, fallbackModel: sdkFeatures.fallbackModel,
-                    sdkDebug: sdkFeatures.sdkDebug,
-                    additionalDirectories: sdkFeatures.additionalDirectories
-                      ? sdkFeatures.additionalDirectories.split(",").map(d => d.trim()).filter(Boolean)
-                      : undefined,
-                  }))) {
+                  for await (const event of query(buildTracedQueryOptions(
+                    "primary",
+                    "non_stream",
+                    makePrompt(),
+                    false,
+                    { resumeSessionId, isUndo, undoRollbackUuid },
+                  ))) {
                     // Only count real assistant content — not SDK error messages
                     // (which arrive as type:"assistant" with an error field set).
                     // Counting error assistants as content would prevent retries.
@@ -833,20 +1063,21 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                     evictSession(profileSessionId, profileScopedCwd, allMessages)
                     sdkUuidMap.length = 0
                     for (let i = 0; i < allMessages.length; i++) sdkUuidMap.push(null)
-                    yield* query(buildQueryOptions({
-                      prompt: buildFreshPrompt(allMessages, stripCacheControl, sanitizeOpts),
-                      model, workingDirectory, systemContext, claudeExecutable,
-                      passthrough, stream: false, sdkAgents, passthroughMcp, cleanEnv: profileEnv, hasDeferredTools,
-                      resumeSessionId: undefined, isUndo: false, undoRollbackUuid: undefined, sdkHooks, adapter, onStderr,
-                      effort, thinking, taskBudget, betas, settingSources,
-                      codeSystemPrompt: sdkFeatures.codeSystemPrompt ? true : undefined, clientSystemPrompt: sdkFeatures.clientSystemPrompt === false ? false : undefined,
-                    memory: sdkFeatures.memory, dreaming: sdkFeatures.dreaming, sharedMemory: sdkFeatures.sharedMemory,
-                      maxBudgetUsd: sdkFeatures.maxBudgetUsd, fallbackModel: sdkFeatures.fallbackModel,
-                      sdkDebug: sdkFeatures.sdkDebug,
-                      additionalDirectories: sdkFeatures.additionalDirectories
-                        ? sdkFeatures.additionalDirectories.split(",").map(d => d.trim()).filter(Boolean)
-                        : undefined,
-                    }))
+                    yield* query(buildTracedQueryOptions(
+                      "stale_uuid_retry_fresh",
+                      "non_stream",
+                      buildFreshPrompt(allMessages, stripCacheControl, sanitizeOpts),
+                      false,
+                      { resumeSessionId: undefined, isUndo: false, undoRollbackUuid: undefined },
+                      {
+                        promptMode: hasMultimodal ? "structured" : "text",
+                        promptInputMessages: allMessages.length,
+                        promptTextChars: hasMultimodal ? 0 : undefined,
+                        promptTextLines: hasMultimodal ? 0 : undefined,
+                        assistantReplayFiltered: false,
+                        sourceMessages: summarizeMessages(allMessages),
+                      },
+                    ))
                     return
                   }
 
@@ -1086,6 +1317,14 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
             isResume,
             passthrough
           )
+          cacheTrace.log("response.usage", {
+            mode: "non_stream",
+            claudeSessionId: currentSessionId || resumeSessionId,
+            stopReason,
+            contentBlocks: contentBlocks.length,
+            usage: summarizeUsage(lastUsage),
+            cacheHitRate: computeCacheHitRate(lastUsage),
+          })
           telemetryStore.record({
             requestId: requestMeta.requestId,
             timestamp: Date.now(),
@@ -1122,13 +1361,11 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
           // Store session for future resume.
           // Fork/subagent requests don't write to the cache — see lookupSession
           // block above for rationale (avoids polluting the parent's key).
-              if (currentSessionId && !isIndependentSession) {
-                storeSession(profileSessionId, body.messages || [], currentSessionId, profileScopedCwd, sdkUuidMap, lastUsage)
-              }
+          persistSessionWithTrace("non_stream", currentSessionId, sdkUuidMap, lastUsage)
 
-              const responseSessionId = currentSessionId || resumeSessionId || `session_${Date.now()}`
+          const responseSessionId = currentSessionId || resumeSessionId || `session_${Date.now()}`
 
-              return new Response(JSON.stringify({
+          return new Response(JSON.stringify({
             id: `msg_${Date.now()}`,
             type: "message",
             role: "assistant",
@@ -1215,19 +1452,13 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                   // not prevent retry. Only stream_event types become SSE output.
                   let didYieldClientEvent = false
                   try {
-                    for await (const event of query(buildQueryOptions({
-                      prompt: makePrompt(), model, workingDirectory, systemContext, claudeExecutable,
-                      passthrough, stream: true, sdkAgents, passthroughMcp, cleanEnv: profileEnv, hasDeferredTools,
-                      resumeSessionId, isUndo, undoRollbackUuid, sdkHooks, adapter, onStderr,
-                      effort, thinking, taskBudget, betas, settingSources,
-                      codeSystemPrompt: sdkFeatures.codeSystemPrompt ? true : undefined, clientSystemPrompt: sdkFeatures.clientSystemPrompt === false ? false : undefined,
-                    memory: sdkFeatures.memory, dreaming: sdkFeatures.dreaming, sharedMemory: sdkFeatures.sharedMemory,
-                      maxBudgetUsd: sdkFeatures.maxBudgetUsd, fallbackModel: sdkFeatures.fallbackModel,
-                      sdkDebug: sdkFeatures.sdkDebug,
-                      additionalDirectories: sdkFeatures.additionalDirectories
-                        ? sdkFeatures.additionalDirectories.split(",").map(d => d.trim()).filter(Boolean)
-                        : undefined,
-                    }))) {
+                    for await (const event of query(buildTracedQueryOptions(
+                      "primary",
+                      "stream",
+                      makePrompt(),
+                      true,
+                      { resumeSessionId, isUndo, undoRollbackUuid },
+                    ))) {
                       if ((event as any).type === "stream_event") {
                         didYieldClientEvent = true
                       }
@@ -1251,20 +1482,21 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                       evictSession(profileSessionId, profileScopedCwd, allMessages)
                       sdkUuidMap.length = 0
                       for (let i = 0; i < allMessages.length; i++) sdkUuidMap.push(null)
-                      yield* query(buildQueryOptions({
-                        prompt: buildFreshPrompt(allMessages, stripCacheControl, sanitizeOpts),
-                        model, workingDirectory, systemContext, claudeExecutable,
-                        passthrough, stream: true, sdkAgents, passthroughMcp, cleanEnv: profileEnv, hasDeferredTools,
-                        resumeSessionId: undefined, isUndo: false, undoRollbackUuid: undefined, sdkHooks, adapter, onStderr,
-                        effort, thinking, taskBudget, betas, settingSources,
-                        codeSystemPrompt: sdkFeatures.codeSystemPrompt ? true : undefined, clientSystemPrompt: sdkFeatures.clientSystemPrompt === false ? false : undefined,
-                    memory: sdkFeatures.memory, dreaming: sdkFeatures.dreaming, sharedMemory: sdkFeatures.sharedMemory,
-                        maxBudgetUsd: sdkFeatures.maxBudgetUsd, fallbackModel: sdkFeatures.fallbackModel,
-                        sdkDebug: sdkFeatures.sdkDebug,
-                        additionalDirectories: sdkFeatures.additionalDirectories
-                          ? sdkFeatures.additionalDirectories.split(",").map(d => d.trim()).filter(Boolean)
-                          : undefined,
-                      }))
+                      yield* query(buildTracedQueryOptions(
+                        "stale_uuid_retry_fresh",
+                        "stream",
+                        buildFreshPrompt(allMessages, stripCacheControl, sanitizeOpts),
+                        true,
+                        { resumeSessionId: undefined, isUndo: false, undoRollbackUuid: undefined },
+                        {
+                          promptMode: hasMultimodal ? "structured" : "text",
+                          promptInputMessages: allMessages.length,
+                          promptTextChars: hasMultimodal ? 0 : undefined,
+                          promptTextLines: hasMultimodal ? 0 : undefined,
+                          assistantReplayFiltered: false,
+                          sourceMessages: summarizeMessages(allMessages),
+                        },
+                      ))
                       return
                     }
 
@@ -1554,9 +1786,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
               // Store session for future resume.
               // Fork/subagent requests don't write to the cache (see lookupSession
               // block for rationale).
-              if (currentSessionId && !isIndependentSession) {
-                storeSession(profileSessionId, body.messages || [], currentSessionId, profileScopedCwd, sdkUuidMap, lastUsage)
-              }
+              persistSessionWithTrace("stream", currentSessionId, sdkUuidMap, lastUsage)
 
               if (!streamClosed) {
                 // In passthrough mode, emit captured tool_use blocks as stream events
@@ -1684,6 +1914,15 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                   isResume,
                   passthrough
                 )
+                cacheTrace.log("response.usage", {
+                  mode: "stream",
+                  claudeSessionId: currentSessionId || resumeSessionId,
+                  streamEventsSeen,
+                  eventsForwarded,
+                  textEventsForwarded,
+                  usage: summarizeUsage(lastUsage),
+                  cacheHitRate: computeCacheHitRate(lastUsage),
+                })
                 telemetryStore.record({
                   requestId: requestMeta.requestId,
                   timestamp: Date.now(),

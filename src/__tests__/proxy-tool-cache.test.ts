@@ -4,8 +4,8 @@
  * preserve prompt cache stability.
  */
 
-import { describe, it, expect, mock, beforeEach } from "bun:test"
-import { assistantMessage, makeRequest, READ_TOOL } from "./helpers"
+import { describe, it, expect, mock, beforeEach, afterEach } from "bun:test"
+import { assistantMessage, makeRequest } from "./helpers"
 
 let capturedQueryParams: any = null
 let mockMessages: any[] = []
@@ -66,13 +66,38 @@ async function post(app: any, body: any, sessionId = SESSION_ID) {
   }))
 }
 
+async function postPi(app: any, body: any, headers: Record<string, string> = {}) {
+  return app.fetch(new Request("http://localhost/v1/messages", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-meridian-agent": "pi",
+      ...headers,
+    },
+    body: JSON.stringify(body),
+  }))
+}
+
+function getPassthroughMcp(options: any) {
+  const mcpServers = options?.mcpServers
+  return mcpServers?.oc
+}
+
 describe("Session tool cache", () => {
+  const originalPassthrough = process.env.MERIDIAN_PASSTHROUGH
+
   beforeEach(() => {
     clearSessionCache()
     capturedQueryParams = null
     mockMessages = [
       assistantMessage([{ type: "text", text: "Done." }]),
     ]
+    process.env.MERIDIAN_PASSTHROUGH = "1"
+  })
+
+  afterEach(() => {
+    if (originalPassthrough === undefined) delete process.env.MERIDIAN_PASSTHROUGH
+    else process.env.MERIDIAN_PASSTHROUGH = originalPassthrough
   })
 
   it("caches tools from first request and reuses when client sends none", async () => {
@@ -126,11 +151,85 @@ describe("Session tool cache", () => {
     }), "session-b")
 
     const opts2 = capturedQueryParams?.options
-    // In passthrough mode without tools, mcpServers should not have the passthrough server
-    const hasPassthroughMcp = opts2?.mcpServers && Object.keys(opts2.mcpServers).some(
-      (k: string) => k.includes("passthrough") || k === "oc"
-    )
-    expect(hasPassthroughMcp).toBeFalsy()
+    expect(getPassthroughMcp(opts2)).toBeUndefined()
+  })
+
+  it("restores the cached tool set for resumed Pi/headerless passthrough turns when the client omits tools", async () => {
+    const app = createTestApp()
+    const system = "Current working directory: /Users/cartwmic/git/meridian"
+
+    await postPi(app, makeRequest({
+      stream: false,
+      system,
+      tools: [TOOL_A, TOOL_B],
+      messages: [{ role: "user", content: "hello" }],
+    }))
+
+    capturedQueryParams = null
+
+    await postPi(app, makeRequest({
+      stream: false,
+      system,
+      tools: [],
+      messages: [
+        { role: "user", content: "hello" },
+        { role: "assistant", content: "Done." },
+        { role: "user", content: "continue" },
+      ],
+    }))
+
+    const opts2 = capturedQueryParams?.options
+    expect(opts2?.resume).toBe("test-session")
+    expect(getPassthroughMcp(opts2)).toBeDefined()
+  })
+
+  it("does not restore cached tools for a headered request that no longer resumes the prior session", async () => {
+    const app = createTestApp()
+
+    await post(app, makeRequest({
+      stream: false,
+      tools: [TOOL_A],
+      messages: [{ role: "user", content: "hello" }],
+    }), "session-replay")
+
+    capturedQueryParams = null
+
+    // Same session header, but this is a replay/fresh turn rather than a continuation.
+    await post(app, makeRequest({
+      stream: false,
+      tools: [],
+      messages: [{ role: "user", content: "hello" }],
+    }), "session-replay")
+
+    const opts2 = capturedQueryParams?.options
+    expect(opts2?.resume).toBeUndefined()
+    expect(getPassthroughMcp(opts2)).toBeUndefined()
+  })
+
+  it("does not restore cached tools for a Pi/headerless request that no longer resumes the prior session", async () => {
+    const app = createTestApp()
+    const system = "Current working directory: /Users/cartwmic/git/meridian"
+
+    await postPi(app, makeRequest({
+      stream: false,
+      system,
+      tools: [TOOL_A],
+      messages: [{ role: "user", content: "hello" }],
+    }))
+
+    capturedQueryParams = null
+
+    // Same fingerprint, but verifyLineage classifies this as a replay/diverged turn.
+    await postPi(app, makeRequest({
+      stream: false,
+      system,
+      tools: [],
+      messages: [{ role: "user", content: "hello" }],
+    }))
+
+    const opts2 = capturedQueryParams?.options
+    expect(opts2?.resume).toBeUndefined()
+    expect(getPassthroughMcp(opts2)).toBeUndefined()
   })
 
   it("updates cached tools when client sends a new set", async () => {
@@ -202,10 +301,7 @@ describe("Session tool cache", () => {
       }))
 
       const opts2 = capturedQueryParams?.options
-      const hasPassthroughMcp = opts2?.mcpServers && Object.keys(opts2.mcpServers).some(
-        (k: string) => k.includes("passthrough") || k === "oc"
-      )
-      expect(hasPassthroughMcp).toBeFalsy()
+      expect(getPassthroughMcp(opts2)).toBeUndefined()
     } finally {
       if (originalPassthrough === undefined) delete process.env.MERIDIAN_PASSTHROUGH
       else process.env.MERIDIAN_PASSTHROUGH = originalPassthrough

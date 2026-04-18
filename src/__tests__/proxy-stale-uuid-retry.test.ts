@@ -18,6 +18,7 @@ import {
 
 // Track query calls to verify retry behavior
 let queryCalls: Array<Record<string, any>> = []
+let queryPrompts: Array<string | AsyncIterable<any>> = []
 let queryCallCount = 0
 
 mock.module("@anthropic-ai/claude-agent-sdk", () => ({
@@ -25,6 +26,7 @@ mock.module("@anthropic-ai/claude-agent-sdk", () => ({
     queryCallCount++
     const callIndex = queryCallCount
     queryCalls.push(opts.options || {})
+    queryPrompts.push(opts.prompt)
     const isStreaming = opts.options?.includePartialMessages === true
 
     return (async function* () {
@@ -94,6 +96,7 @@ describe("Stale UUID retry", () => {
   beforeEach(() => {
     clearSessionCache()
     queryCalls = []
+    queryPrompts = []
     queryCallCount = 0
   })
 
@@ -182,6 +185,68 @@ describe("Stale UUID retry", () => {
     // Verify retry happened: first call with resumeSessionAt, second without
     expect(queryCalls[0]!.resumeSessionAt).toBe("uuid-assistant-1")
     expect(queryCalls[1]!.resumeSessionAt).toBeUndefined()
+  })
+
+  it("retries stale undo as a fresh prompt with full history replay", async () => {
+    const app = createTestApp()
+    const sessionId = "sess-stale-full-history"
+
+    const messages = [
+      { role: "user", content: "Create foo.txt with hello" },
+      {
+        role: "assistant",
+        content: [
+          { type: "text", text: "I'll create the file." },
+          { type: "tool_use", id: "toolu_123", name: "write", input: { path: "foo.txt", content: "hello" } },
+        ],
+      },
+      {
+        role: "user",
+        content: [
+          { type: "tool_result", tool_use_id: "toolu_123", content: "File written." },
+        ],
+      },
+      { role: "assistant", content: "Done" },
+    ]
+    storeSession(sessionId, messages, "sdk-stale-history", "/tmp/test", [
+      null,
+      "uuid-assistant-1",
+      null,
+      "uuid-assistant-2",
+    ])
+
+    const undoMessages = [
+      { role: "user", content: "Create foo.txt with hello" },
+      {
+        role: "assistant",
+        content: [
+          { type: "text", text: "I'll create the file." },
+          { type: "tool_use", id: "toolu_123", name: "write", input: { path: "foo.txt", content: "hello" } },
+        ],
+      },
+      {
+        role: "user",
+        content: [
+          { type: "tool_result", tool_use_id: "toolu_123", content: "File written." },
+        ],
+      },
+      { role: "user", content: "Actually use goodbye instead" },
+    ]
+
+    const response = await post(
+      app,
+      { model: "sonnet", stream: false, messages: undoMessages },
+      { "x-opencode-session": sessionId }
+    )
+
+    expect(response.status).toBe(200)
+    expect(queryCalls[0]!.resumeSessionAt).toBe("uuid-assistant-1")
+    expect(queryCalls[1]!.resume).toBeUndefined()
+    expect(queryCalls[1]!.resumeSessionAt).toBeUndefined()
+    expect(String(queryPrompts[1]!)).toContain("Assistant: I'll create the file.")
+    expect(String(queryPrompts[1]!)).toContain("[Tool Use: write({\"path\":\"foo.txt\",\"content\":\"hello\"})]")
+    expect(String(queryPrompts[1]!)).toContain("[Tool Result for toolu_123: File written.]")
+    expect(String(queryPrompts[1]!)).toContain("Actually use goodbye instead")
   })
 
   it("evicts stale session from cache after retry", async () => {
