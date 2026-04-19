@@ -334,6 +334,43 @@ describe("SessionRuntime — pending executions", () => {
   })
 })
 
+describe("SessionRuntime — tool_use_id FIFO", () => {
+  function emptyRuntime() {
+    return createSessionRuntime({
+      profileSessionId: "p1",
+      optionsHash: "h",
+      query: (async function* () { /* empty */ })() as unknown as Query,
+      inputQueue: createAsyncQueue<SDKUserMessage>(),
+    })
+  }
+
+  it("dequeues ids in FIFO order per tool name", () => {
+    const runtime = emptyRuntime()
+    runtime.enqueueToolUseId("read", "toolu_1")
+    runtime.enqueueToolUseId("read", "toolu_2")
+    runtime.enqueueToolUseId("read", "toolu_3")
+    expect(runtime.dequeueToolUseId("read")).toBe("toolu_1")
+    expect(runtime.dequeueToolUseId("read")).toBe("toolu_2")
+    expect(runtime.dequeueToolUseId("read")).toBe("toolu_3")
+    expect(runtime.dequeueToolUseId("read")).toBeUndefined()
+  })
+
+  it("keeps queues per tool name isolated", () => {
+    const runtime = emptyRuntime()
+    runtime.enqueueToolUseId("read", "r1")
+    runtime.enqueueToolUseId("write", "w1")
+    runtime.enqueueToolUseId("read", "r2")
+    expect(runtime.dequeueToolUseId("read")).toBe("r1")
+    expect(runtime.dequeueToolUseId("write")).toBe("w1")
+    expect(runtime.dequeueToolUseId("read")).toBe("r2")
+  })
+
+  it("returns undefined for an unknown tool name", () => {
+    const runtime = emptyRuntime()
+    expect(runtime.dequeueToolUseId("read")).toBeUndefined()
+  })
+})
+
 describe("SessionRuntimeManager", () => {
   function makeRuntime(id: string, lastActivity: number) {
     const runtime = createSessionRuntime({

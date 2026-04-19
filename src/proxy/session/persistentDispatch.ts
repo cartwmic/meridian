@@ -1,0 +1,258 @@
+/**
+ * Persistent-mode turn dispatcher (design §D1, §D4, §D5, §D6, §D11).
+ *
+ * Server.ts calls `dispatchPersistentTurn` at each of its `query()` call
+ * sites when `ProxyConfig.persistentSessions` is true and the request is
+ * not an undo/fork. The dispatcher decides:
+ *
+ *   - Find the existing `SessionRuntime` for this `profileSessionId`, OR
+ *   - Cold-reattach via `resume` if `sessionStore` has the session but the
+ *     live-query map doesn't, OR
+ *   - Start a fresh runtime for a brand-new session.
+ *
+ * On top of that it handles:
+ *   - Options drift (D4): in-place `setModel`/`applyFlagSettings`, or
+ *     close+reopen on reopen-critical hash mismatch.
+ *   - Request shape: plain user messages `push()` into the input queue;
+ *     user messages carrying `tool_result` blocks whose `tool_use_id`
+ *     matches a pending deferred handler resolve the handler's promise
+ *     with the real content instead of pushing.
+ *   - Cache_control stripping (D10): content is sanitized before push.
+ *
+ * Keeping this as its own module means server.ts stays mostly an HTTP /
+ * SSE orchestrator — it hands us a request envelope and consumes the
+ * events we yield.
+ */
+
+import type { SDKMessage, SDKUserMessage } from "@anthropic-ai/claude-agent-sdk"
+import { stripCacheControl } from "../contentSanitizer"
+import {
+  classifyPassthroughRequest,
+  type SessionRuntime,
+  type SessionRuntimeManager,
+  type ReopenCriticalOptions,
+} from "./runtime"
+import {
+  classifyOptionsDrift,
+  type InPlaceOptions,
+  type InPlaceUpdate,
+  type RuntimeOptionsSnapshot,
+} from "./optionsClassifier"
+
+// --- Types -----------------------------------------------------------------
+
+export interface PersistentTurnRequest {
+  profileSessionId: string
+  /** Last user message's content from `body.messages` — the delta to push. */
+  userContent: unknown
+  /** Reopen-critical options hash input (for §D4 drift detection). */
+  reopenCritical: ReopenCriticalOptions
+  /** In-place-updatable options (model, effort, thinking). */
+  inPlace: InPlaceOptions
+  /** Whether the incoming request is an undo / fork (§D6). */
+  isUndo: boolean
+  undoRollbackUuid?: string
+  /** Claude SDK session id from session/cache.ts when cold-reattach is needed. */
+  resumeSessionIdFromCache?: string
+}
+
+export interface CreateRuntimeArgs {
+  profileSessionId: string
+  reopenCritical: ReopenCriticalOptions
+  inPlace: InPlaceOptions
+  resumeSessionId?: string
+  forkSession?: boolean
+  resumeSessionAt?: string
+}
+
+/**
+ * Factory the caller (server.ts) provides. Constructs the passthrough MCP
+ * with deferred handlers bound to the runtime, starts `query()` with an
+ * input queue, and returns a `SessionRuntime` wrapping the whole thing.
+ * The dispatcher does not know how to construct SDK queries — it only
+ * orchestrates runtimes.
+ */
+export type CreateRuntimeFn = (args: CreateRuntimeArgs) => Promise<SessionRuntime>
+
+/**
+ * Side-channel information the dispatcher needs from per-runtime state.
+ * Stored in a WeakMap keyed by runtime so we don't pollute the shared
+ * `SessionRuntime` interface with dispatcher-specific bookkeeping.
+ */
+interface RuntimeDispatchState {
+  snapshot: RuntimeOptionsSnapshot
+}
+
+const runtimeDispatchState = new WeakMap<SessionRuntime, RuntimeDispatchState>()
+
+export function attachDispatchState(runtime: SessionRuntime, snapshot: RuntimeOptionsSnapshot): void {
+  runtimeDispatchState.set(runtime, { snapshot })
+}
+
+export function getDispatchState(runtime: SessionRuntime): RuntimeDispatchState | undefined {
+  return runtimeDispatchState.get(runtime)
+}
+
+// --- Sub-steps (exported for testing) --------------------------------------
+
+/**
+ * Apply a list of in-place updates to the live query before pushing this
+ * turn's user message. Per §D4, each update is awaited in order so the
+ * model sees the new setting starting with the next turn.
+ */
+export async function applyInPlaceUpdates(
+  runtime: SessionRuntime,
+  updates: InPlaceUpdate[],
+): Promise<void> {
+  for (const u of updates) {
+    switch (u.kind) {
+      case "setModel":
+        await runtime.query.setModel(u.model)
+        break
+      case "applyFlagSettings":
+        await runtime.query.applyFlagSettings(u.settings as never)
+        break
+    }
+  }
+}
+
+/**
+ * Resolve every `tool_result` block in `resolveList` against the runtime's
+ * pending-execution registry. Returns the number of entries resolved.
+ */
+export function resolvePendingFromRequest(
+  runtime: SessionRuntime,
+  resolveList: Array<{ toolUseId: string; content: string }>,
+): number {
+  let resolved = 0
+  for (const r of resolveList) {
+    if (runtime.resolvePendingExecution(r.toolUseId, r.content)) resolved++
+  }
+  return resolved
+}
+
+/**
+ * Build the `SDKUserMessage` to push into the runtime's input queue.
+ * Strips cache_control per §D10, honors plain-string content, and wraps
+ * single-image/tool_result blocks into a content array.
+ */
+export function buildPushMessage(content: unknown): SDKUserMessage {
+  const cleaned = stripCacheControl(content)
+  return {
+    type: "user",
+    message: { role: "user", content: cleaned as SDKUserMessage["message"]["content"] },
+    parent_tool_use_id: null,
+  }
+}
+
+// --- Main dispatcher -------------------------------------------------------
+
+export interface DispatchDeps {
+  manager: SessionRuntimeManager
+  createRuntime: CreateRuntimeFn
+}
+
+/**
+ * Handle a single persistent-mode turn. Yields SDK events for the caller
+ * to translate into SSE / non-stream response format.
+ *
+ * The caller (server.ts) is responsible for everything OUTSIDE the
+ * runtime turn: request parsing, lineage verification, adapter detection,
+ * SSE framing, session cache updates, telemetry. The dispatcher's surface
+ * is only about "the turn itself through the runtime."
+ */
+export async function* dispatchPersistentTurn(
+  req: PersistentTurnRequest,
+  deps: DispatchDeps,
+): AsyncGenerator<SDKMessage, void> {
+  let runtime = await acquireOrCreateRuntime(req, deps)
+
+  // --- Options drift check ---
+  const state = runtimeDispatchState.get(runtime)
+  if (state) {
+    const drift = classifyOptionsDrift(
+      { reopenCritical: req.reopenCritical, inPlace: req.inPlace },
+      state.snapshot,
+    )
+    if (drift.hashMismatch) {
+      // Close the old runtime and cold-reattach with the new options.
+      await deps.manager.drop(req.profileSessionId)
+      runtime = await deps.createRuntime({
+        profileSessionId: req.profileSessionId,
+        reopenCritical: req.reopenCritical,
+        inPlace: req.inPlace,
+        resumeSessionId: runtime.claudeSessionId ?? req.resumeSessionIdFromCache,
+      })
+      deps.manager.put(runtime)
+    } else if (drift.inPlaceUpdates.length > 0) {
+      await applyInPlaceUpdates(runtime, drift.inPlaceUpdates)
+    }
+  }
+
+  // --- Acquire turn mutex ---
+  const release = await runtime.acquireTurn()
+  try {
+    // --- Classify request content: resolve pending OR push ---
+    const classification = classifyPassthroughRequest(
+      req.userContent,
+      runtime.pendingToolUseIds,
+    )
+
+    if (classification.resolve.length > 0) {
+      resolvePendingFromRequest(runtime, classification.resolve)
+    }
+
+    if (classification.pushContent !== null) {
+      runtime.inputQueue.push(buildPushMessage(classification.pushContent))
+    } else if (classification.resolve.length === 0) {
+      // Nothing to resolve AND nothing to push — push the raw content as-is.
+      // Path shouldn't normally trigger; included as a safety net.
+      runtime.inputQueue.push(buildPushMessage(req.userContent))
+    }
+
+    // --- Yield events until the turn terminator ---
+    for await (const event of runtime.consumeTurn()) {
+      yield event
+    }
+  } finally {
+    release()
+  }
+}
+
+// --- Acquisition strategy --------------------------------------------------
+
+async function acquireOrCreateRuntime(
+  req: PersistentTurnRequest,
+  deps: DispatchDeps,
+): Promise<SessionRuntime> {
+  // Undo/fork always builds a fresh runtime (§D6): close the warm one if
+  // present, start a new query with forkSession: true, resumeSessionAt.
+  if (req.isUndo) {
+    const existing = deps.manager.get(req.profileSessionId)
+    if (existing) await deps.manager.drop(req.profileSessionId)
+    const runtime = await deps.createRuntime({
+      profileSessionId: req.profileSessionId,
+      reopenCritical: req.reopenCritical,
+      inPlace: req.inPlace,
+      resumeSessionId: req.resumeSessionIdFromCache,
+      forkSession: true,
+      resumeSessionAt: req.undoRollbackUuid,
+    })
+    deps.manager.put(runtime)
+    return runtime
+  }
+
+  const warm = deps.manager.get(req.profileSessionId)
+  if (warm) return warm
+
+  // Cold reattach (§D5): if session/cache.ts knows the Claude SDK session id
+  // but we don't have a live runtime for it, start a new query with resume.
+  const runtime = await deps.createRuntime({
+    profileSessionId: req.profileSessionId,
+    reopenCritical: req.reopenCritical,
+    inPlace: req.inPlace,
+    resumeSessionId: req.resumeSessionIdFromCache,
+  })
+  deps.manager.put(runtime)
+  return runtime
+}

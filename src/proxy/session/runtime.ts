@@ -270,6 +270,20 @@ export interface SessionRuntime {
   readonly pendingToolUseIds: ReadonlySet<string>
   /** How many pending handlers are currently awaiting. */
   readonly pendingCount: number
+
+  /**
+   * PreToolUse → MCP handler coordination FIFO.
+   *
+   * The PreToolUse hook fires before the SDK invokes the corresponding MCP
+   * handler and has access to `tool_use_id`; the MCP handler (via the
+   * `@modelcontextprotocol/sdk` signature) does NOT. The hook enqueues the
+   * id onto a per-tool-name queue; the handler dequeues the head of its
+   * queue to correlate. FIFO ordering is preserved because the SDK fires
+   * handlers sequentially and PreToolUse always fires strictly before the
+   * handler it corresponds to.
+   */
+  enqueueToolUseId(toolName: string, toolUseId: string): void
+  dequeueToolUseId(toolName: string): string | undefined
 }
 
 export function createSessionRuntime(init: SessionRuntimeInit): SessionRuntime {
@@ -287,6 +301,8 @@ export function createSessionRuntime(init: SessionRuntimeInit): SessionRuntime {
 
   // Pending deferred handlers for passthrough tool execution.
   const pending = new Map<string, PendingExecution>()
+  // Per-tool-name FIFO of captured tool_use_ids (PreToolUse → MCP handler).
+  const toolUseIdFifo = new Map<string, string[]>()
 
   const runtime: SessionRuntime = {
     profileSessionId: init.profileSessionId,
@@ -384,6 +400,20 @@ export function createSessionRuntime(init: SessionRuntimeInit): SessionRuntime {
 
     get pendingCount(): number {
       return pending.size
+    },
+
+    enqueueToolUseId(toolName: string, toolUseId: string): void {
+      const queue = toolUseIdFifo.get(toolName) ?? []
+      queue.push(toolUseId)
+      toolUseIdFifo.set(toolName, queue)
+    },
+
+    dequeueToolUseId(toolName: string): string | undefined {
+      const queue = toolUseIdFifo.get(toolName)
+      if (!queue || queue.length === 0) return undefined
+      const id = queue.shift()
+      if (queue.length === 0) toolUseIdFifo.delete(toolName)
+      return id
     },
   }
   return runtime
