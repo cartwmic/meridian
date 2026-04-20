@@ -209,6 +209,26 @@ export async function runCli(
       process.exit(1)
     }
   })
+
+  // Graceful shutdown on SIGTERM / SIGINT so ProxyInstance.close() gets a
+  // chance to await SessionRuntime.closeAll() (§6.1). Without this the OS
+  // kills meridian immediately and the persistent runtime subprocesses
+  // get reaped by parent-death rather than a clean close, skipping the
+  // lifecycle.close emits and any pending-handler reject logic.
+  let shuttingDown = false
+  const gracefulShutdown = async (signal: string) => {
+    if (shuttingDown) return
+    shuttingDown = true
+    console.error(`[meridian] received ${signal}, closing gracefully`)
+    try {
+      await proxy.close()
+    } catch (err) {
+      console.error(`[meridian] close error: ${err instanceof Error ? err.message : err}`)
+    }
+    process.exit(0)
+  }
+  process.on("SIGTERM", () => { void gracefulShutdown("SIGTERM") })
+  process.on("SIGINT", () => { void gracefulShutdown("SIGINT") })
 }
 
 if (import.meta.main) {

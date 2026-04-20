@@ -227,6 +227,20 @@ async function* runPersistent(ctx: TurnContext & { profileSessionId: string }, d
   let firstSessionIdSeen = false
   let sawToolUse = false
 
+  // NOTE: §5.12d continuation-after-pending SSE framing for multi-tool
+  // parallel passthrough in streaming mode is a KNOWN LIMITATION. When
+  // the SDK's MCP handler unblocks on the tool_result return, it resumes
+  // emitting stream events for the SAME in-flight assistant message
+  // (content_block_* with no preceding fresh message_start). Pi (and
+  // likely other clients) rejects the resulting SSE stream. Single-tool
+  // scenarios work because the SDK happens to re-open message framing;
+  // parallel-tool scenarios do not. Fix requires either (a) a synthetic
+  // message_start injection with exact-matching message_id + model that
+  // Pi accepts, or (b) a server.ts SSE layer rewrite that re-synthesises
+  // the continuation as a standalone message. Both are out of scope for
+  // this change and tracked as follow-up. Non-streaming + non-passthrough
+  // + single-tool-streaming passthrough paths are all unaffected.
+
   for await (const event of dispatchPersistentTurn(req, { manager: deps.manager, createRuntime })) {
     // Capture the SDK session id on the first result event so server.ts
     // can persist it via storeSession(...).
@@ -256,9 +270,12 @@ async function* runPersistent(ctx: TurnContext & { profileSessionId: string }, d
     // yielding a tool_use-bearing message, the SDK is blocked waiting for
     // the client to return the tool_result. Do not await the next
     // SDK event (it will never come until the client returns). Synthesise
-    // a `result` terminator so the server-side SSE / non-stream layer
-    // treats this as a clean turn end. The runtime stays alive in the
-    // manager; the next HTTP request's tool_result resolves the handler.
+    // an SSE message_delta { stop_reason: "tool_use" } + message_stop in
+    // streaming mode (so Pi's SSE parser closes cleanly on a valid frame
+    // sequence), followed by a synthetic `result` terminator so the
+    // server-side SSE / non-stream layer treats this as a clean turn end.
+    // The runtime stays alive in the manager; the next HTTP request's
+    // tool_result resolves the handler.
     const runtime = deps.manager.get(ctx.profileSessionId)
     if (sawToolUse && runtime && runtime.pendingCount > 0) {
       yield makePendingPauseResult(runtime.claudeSessionId, ctx.stream)
