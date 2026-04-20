@@ -43,6 +43,7 @@ import {
   type LineageResult,
   type TokenUsage,
 } from "./session/lineage"
+import { getConversationFingerprint } from "./session/fingerprint"
 // Re-export for backwards compatibility (existing tests import from here)
 
 import { lookupSession, storeSession, clearSessionCache, getMaxSessionsLimit, evictSession, getSessionByClaudeId } from "./session/cache"
@@ -298,9 +299,11 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
   const runtimeManager: SessionRuntimeManager = createSessionRuntimeManager({
     idleMs: finalConfig.persistentSessionIdleMs ?? 900_000,
     maxLive: finalConfig.persistentSessionMaxLive ?? 32,
-    onLifecycle: (event, profileSessionId) => {
+    onLifecycle: (lifecycleEvent, profileSessionId) => {
       // §7.2 — emit runtime lifecycle events on the existing log channel.
-      claudeLog("persistent.lifecycle", { event, profileSessionId })
+      // Key the state under `lifecycle` so the log line's outer `event`
+      // field continues to identify the log category.
+      claudeLog("persistent.lifecycle", { lifecycle: lifecycleEvent, profileSessionId })
     },
   })
   const persistentSweepInterval = setInterval(() => {
@@ -814,6 +817,15 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
         const persistentPassthroughSpec = passthrough && requestTools.length > 0
           ? { tools: requestTools as never[], coreToolNames: adapter.getCoreToolNames?.() }
           : null
+        // For headerless adapters (Pi), fall back to the conversation
+        // fingerprint as the persistent-runtime key. Without this,
+        // `profileSessionId` would be undefined and startTurn would
+        // silently take the legacy path even when the flag is on.
+        const effectivePersistentSessionId: string | undefined = profileSessionId
+          ?? (() => {
+            const fp = getConversationFingerprint(body.messages || [], profileScopedCwd)
+            return fp ? (profile.id !== "default" ? `${profile.id}:fp:${fp}` : `fp:${fp}`) : undefined
+          })()
         // Called on first `result` event from the persistent dispatcher so
         // session/cache.ts learns about the newly-assigned Claude SDK
         // session id. The warmth of a warm runtime without this hook would
@@ -895,7 +907,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                     additionalDirectories: sdkFeatures.additionalDirectories
                       ? sdkFeatures.additionalDirectories.split(",").map(d => d.trim()).filter(Boolean)
                       : undefined,
-                    profileSessionId, userContent: persistentUserContent, passthroughSpec: persistentPassthroughSpec,
+                    profileSessionId: effectivePersistentSessionId, userContent: persistentUserContent, passthroughSpec: persistentPassthroughSpec,
                   } satisfies TurnContext, persistentDeps)) {
                     // Only count real assistant content — not SDK error messages
                     // (which arrive as type:"assistant" with an error field set).
@@ -936,7 +948,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                       additionalDirectories: sdkFeatures.additionalDirectories
                         ? sdkFeatures.additionalDirectories.split(",").map(d => d.trim()).filter(Boolean)
                         : undefined,
-                      profileSessionId, userContent: persistentUserContent, passthroughSpec: persistentPassthroughSpec,
+                      profileSessionId: effectivePersistentSessionId, userContent: persistentUserContent, passthroughSpec: persistentPassthroughSpec,
                     } satisfies TurnContext, persistentDeps)
                     return
                   }
@@ -1318,7 +1330,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                       additionalDirectories: sdkFeatures.additionalDirectories
                         ? sdkFeatures.additionalDirectories.split(",").map(d => d.trim()).filter(Boolean)
                         : undefined,
-                      profileSessionId, userContent: persistentUserContent, passthroughSpec: persistentPassthroughSpec,
+                      profileSessionId: effectivePersistentSessionId, userContent: persistentUserContent, passthroughSpec: persistentPassthroughSpec,
                     } satisfies TurnContext, persistentDeps)) {
                       if ((event as any).type === "stream_event") {
                         didYieldClientEvent = true
@@ -1356,7 +1368,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                         additionalDirectories: sdkFeatures.additionalDirectories
                           ? sdkFeatures.additionalDirectories.split(",").map(d => d.trim()).filter(Boolean)
                           : undefined,
-                        profileSessionId, userContent: persistentUserContent, passthroughSpec: persistentPassthroughSpec,
+                        profileSessionId: effectivePersistentSessionId, userContent: persistentUserContent, passthroughSpec: persistentPassthroughSpec,
                       } satisfies TurnContext, persistentDeps)
                       return
                     }
