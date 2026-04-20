@@ -48,17 +48,11 @@ This task produces a working end-to-end flow (even crudely) before §5.12 can be
 - [x] 1d.7 Extend spike for multi-tool — **Scenario E PASS**: SDK invokes handlers sequentially (even when model emits them in one turn); each blocks until resolved; final response correctly combines results. T1 cacheRead=42019, T2 cacheRead=14676.
 - [x] 1d.8 Test deferred-handler rejection — **Scenario F PASS (runtime recovery)**: handler reject with error; SDK fabricates error tool_result, model continues, runtime stays healthy for subsequent turns (T2 cacheRead=14071). Rejection is a safe mechanism for idle-timeout enforcement.
 
-## 2. Options-drift observability (optional, parallel-safe, gates task 5 kickoff)
+## 2. Options-drift observability
 
-Before committing to D4's in-place-vs-reopen policy, measure how often real traffic triggers reopens. High drift would invalidate D4.
+Instrument the options-drift path so production runs are diagnosable. Observation/monitoring cadence is out of scope for this change — ship the emission; interpret it live as needed.
 
 - [ ] 2.1 Extend cache-trace emission (gated, log-only) to record `optionsHashReopenCritical` per turn using the fields listed in design.md D4
-- [ ] 2.2 Run for one week against real traffic; confirm reopen-critical drift rate < 10 %
-- [ ] 2.3 If drift > 10 %, revisit D4 in design.md before proceeding to task 5
-
-**Gate:** Task 5 kickoff is gated on §2.2 completing with pass criterion met (drift rate < 10 %), or on an explicit decision recorded in design.md acknowledging the observed drift rate and accepting the reopen churn as the cost of correctness.
-
-**Waiver (2026-04-19):** Gate §2.2 is **explicitly waived**. This is a solo-dev environment without the traffic volume to make a one-week observability pass meaningful. We accept the risk that D4's reopen policy may churn more than predicted in production and commit to tuning it after live Pi-passthrough observations in task §9.1. §2.1–§2.3 remain as backlog items rather than blockers.
 
 ## 3. Module skeleton — `SessionRuntime`
 
@@ -141,26 +135,11 @@ These are specific, scoped issues the review agent flagged in the shipped code. 
 - [ ] 7.4 Integration test confirming the trace fields are present and correctly tagged
 - [ ] 7.5 Audit `src/plugin/claude-max-headers.ts` and any other plugin code for per-request lifecycle assumptions (persistent mode means one subprocess per session rather than per request — header-mutation plugins may need adjustment). Document persistent-mode semantics for plugin authors in `src/plugin/README.md` or similar; add a plugin-compat smoke test.
 
-## 8. Rollout — OpenCode adapter first
+## 8. Adapter-scoped flag override
 
-Rationale for OpenCode-first (not Pi-first, which was the original plan): OpenCode's tool shape most closely matches what the spike validated (SDK-executed tools via `createSdkMcpServer`). Pi adds the client-executed-tool pairing risk on top of the cache behavior. Validating the cache win on OpenCode first isolates the cache variable; Pi then tests the pairing extension separately. See design.md §D9 for the full rationale.
+Per-adapter enablement + the eventual default-flip are out-of-band operational decisions, not implementation tasks. Design rationale for OpenCode-first (vs. Pi-first) and per-adapter rollout sequencing is retained in design.md §D9. What ships as code:
 
 - [ ] 8.1 Adapter-scoped flag override: allow enabling persistent mode per-adapter so one adapter can be on while others are off
-- [ ] 8.2 Manually flip the OpenCode-adapter flag on a staging instance
-- [ ] 8.3 Monitor `mode=persistent` metrics for one week
-- [ ] 8.4 Pass criteria (both must hold): (a) ≥ 95 % of non-first-turn OpenCode requests show `cacheReadInputTokens > 0`; (b) OpenCode error-rate regression ≤ 0.5 pp vs. the prior week on `persistentSessions: false`
-- [ ] 8.5 If pass, proceed to task 9. If fail, gather evidence and revisit design.
-
-## 9. Rollout — remaining adapters
-
-Same pass criteria as §8.4 apply to each adapter: (a) ≥ 95 % non-first-turn cacheRead hit rate, (b) error-rate regression ≤ 0.5 pp vs. the prior `persistentSessions: false` baseline for that adapter.
-
-- [ ] 9.1 Enable persistent mode for Pi adapter (the driver case; tests the client-executed-tool pairing path under real traffic); monitor one week; pass criteria per above
-- [ ] 9.2 Enable persistent mode for ForgeCode adapter; monitor one week; pass criteria per above
-- [ ] 9.3 Enable persistent mode for Crush adapter; monitor one week; pass criteria per above
-- [ ] 9.4 Enable persistent mode for Droid adapter; monitor one week; pass criteria per above
-- [ ] 9.5 Enable persistent mode for generic passthrough adapter; monitor one week; pass criteria per above
-- [ ] 9.6 When all six adapters (OpenCode + the five above) are green for two weeks, flip `ProxyConfig.persistentSessions` default to `true`
 
 ## 10. Cleanup & archive
 
@@ -169,4 +148,4 @@ Same pass criteria as §8.4 apply to each adapter: (a) ≥ 95 % non-first-turn c
 - [ ] 10.3 Update `ARCHITECTURE.md` with the new `session/runtime.ts` module and its contract
 - [ ] 10.4 Update `CLAUDE.md` with persistent-session guidance for future contributors
 - [ ] 10.5 Run `openspec validate --strict` and `openspec archive persistent-sdk-sessions`
-- [ ] 10.6 Update `E2E.md` with persistent-mode scenarios (warm turn caches, cold-reattach after restart, undo reopen preserves lineage, Pi client-executed-tool pairing). Run the E2E suite once with `persistentSessions: true` before the default flip (task 9.6).
+- [ ] 10.6 Update `E2E.md` with persistent-mode scenarios (warm turn caches, cold-reattach after restart, undo reopen preserves lineage, Pi client-executed-tool pairing). Run the E2E suite once with `persistentSessions: true` before enabling the flag by default.
