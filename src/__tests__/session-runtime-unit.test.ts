@@ -2,6 +2,7 @@ import { describe, expect, it } from "bun:test"
 import type { Query, SDKMessage, SDKUserMessage } from "@anthropic-ai/claude-agent-sdk"
 
 import {
+  AsyncQueueOverflowError,
   classifyPassthroughRequest,
   createAsyncQueue,
   createMutex,
@@ -45,6 +46,49 @@ describe("AsyncQueue", () => {
     const it = q[Symbol.asyncIterator]()
     const result = await it.next()
     expect(result.done).toBe(true)
+  })
+
+  it("fires onHighWater when depth crosses the soft threshold", () => {
+    const depths: number[] = []
+    const q = createAsyncQueue<number>({ highWaterMark: 2, onHighWater: (d) => depths.push(d) })
+    q.push(1)
+    q.push(2)
+    expect(depths).toEqual([]) // at threshold but not over
+    q.push(3)
+    expect(depths).toEqual([3]) // fires once as depth crosses 2→3
+    q.push(4)
+    expect(depths).toEqual([3]) // doesn't re-fire while sustained above
+  })
+
+  it("re-fires onHighWater after depth drops back below the threshold and re-crosses", async () => {
+    const depths: number[] = []
+    const q = createAsyncQueue<number>({ highWaterMark: 1, onHighWater: (d) => depths.push(d) })
+    q.push(1); q.push(2) // depth=2, crosses 1→2, fires
+    expect(depths).toEqual([2])
+    const it = q[Symbol.asyncIterator]()
+    await it.next(); await it.next() // drain back to depth 0
+    q.push(3); q.push(4) // depth=2 again, re-fires
+    expect(depths).toEqual([2, 2])
+  })
+
+  it("throws AsyncQueueOverflowError when pushing past hardCap", () => {
+    const q = createAsyncQueue<number>({ hardCap: 2 })
+    q.push(1); q.push(2)
+    expect(() => q.push(3)).toThrow(AsyncQueueOverflowError)
+    try {
+      q.push(4)
+    } catch (err) {
+      if (err instanceof AsyncQueueOverflowError) {
+        expect(err.hardCap).toBe(2)
+      }
+    }
+  })
+
+  it("exposes current depth via readonly getter", () => {
+    const q = createAsyncQueue<number>()
+    expect(q.depth).toBe(0)
+    q.push(1); q.push(2); q.push(3)
+    expect(q.depth).toBe(3)
   })
 })
 
@@ -244,10 +288,32 @@ describe("classifyPassthroughRequest", () => {
     expect(result.resolve).toEqual([{ toolUseId: "toolu_1", content: "line one\nline two" }])
   })
 
-  it("treats a plain string user content as a pure push (no resolve)", () => {
+  it("wraps a plain string user content into a single-element push array", () => {
     const result = classifyPassthroughRequest("hello", new Set(["toolu_1"]))
     expect(result.resolve).toEqual([])
-    expect(result.pushContent).toEqual([])
+    expect(result.pushContent).toEqual(["hello"])
+  })
+
+  it("wraps a non-array object user content into a single-element push array", () => {
+    // §3.15: previously returned `pushContent: []` which silently lost the
+    // payload. The fix wraps non-array non-null content in a one-element
+    // array so the push survives. tool_result correlation does NOT happen
+    // for the non-array shape — only the canonical content-block array
+    // carries `tool_use_id` blocks the classifier knows how to resolve.
+    const block = { type: "text", text: "hello" }
+    const result = classifyPassthroughRequest(block, new Set(["toolu_1"]))
+    expect(result.resolve).toEqual([])
+    expect(result.pushContent).toEqual([block])
+  })
+
+  it("returns null pushContent for null / undefined user content", () => {
+    const fromNull = classifyPassthroughRequest(null, new Set(["toolu_1"]))
+    expect(fromNull.resolve).toEqual([])
+    expect(fromNull.pushContent).toBeNull()
+
+    const fromUndef = classifyPassthroughRequest(undefined, new Set(["toolu_1"]))
+    expect(fromUndef.resolve).toEqual([])
+    expect(fromUndef.pushContent).toBeNull()
   })
 
   it("returns empty resolve when pending set is empty", () => {
@@ -426,6 +492,34 @@ describe("SessionRuntimeManager", () => {
     expect(mgr.get("stale")).toBeUndefined()
     expect(mgr.get("fresh")).toBe(fresh)
     expect(stale.closed).toBe(true)
+  })
+
+  it("sweepIdle skips stale runtimes whose turn mutex is currently held (§3.12)", async () => {
+    let clock = 1_000_000
+    const mgr = createSessionRuntimeManager({ idleMs: 1000, maxLive: 4, now: () => clock })
+    const busyStale = makeRuntime("busy", clock - 2000)
+    const idleStale = makeRuntime("idle", clock - 2000)
+    mgr.put(busyStale)
+    mgr.put(idleStale)
+
+    // Hold the busy runtime's turn mutex — simulates an in-flight turn.
+    const release = await busyStale.acquireTurn()
+    try {
+      const evicted = await mgr.sweepIdle()
+      expect(evicted).toBe(1)
+      expect(mgr.get("idle")).toBeUndefined()
+      expect(mgr.get("busy")).toBe(busyStale) // still alive
+      expect(busyStale.closed).toBe(false)
+      expect(idleStale.closed).toBe(true)
+    } finally {
+      release()
+    }
+
+    // Now that the mutex is released, a second sweep collects the busy one.
+    const evicted2 = await mgr.sweepIdle()
+    expect(evicted2).toBe(1)
+    expect(mgr.get("busy")).toBeUndefined()
+    expect(busyStale.closed).toBe(true)
   })
 
   it("closeAll closes every runtime and empties the map", async () => {

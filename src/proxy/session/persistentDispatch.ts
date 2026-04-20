@@ -34,6 +34,7 @@ import {
 } from "./runtime"
 import {
   classifyOptionsDrift,
+  snapshotOptions,
   type InPlaceOptions,
   type InPlaceUpdate,
   type RuntimeOptionsSnapshot,
@@ -78,6 +79,11 @@ export type CreateRuntimeFn = (args: CreateRuntimeArgs) => Promise<SessionRuntim
  * Side-channel information the dispatcher needs from per-runtime state.
  * Stored in a WeakMap keyed by runtime so we don't pollute the shared
  * `SessionRuntime` interface with dispatcher-specific bookkeeping.
+ *
+ * **Single-owner contract:** the dispatcher is the ONLY writer — see
+ * `attachStateOnCreate` below, called on every cold-reattach / create /
+ * reopen. Factories (e.g. `makePersistentCreateRuntime`) MUST NOT call
+ * `attachDispatchState` themselves.
  */
 interface RuntimeDispatchState {
   snapshot: RuntimeOptionsSnapshot
@@ -85,6 +91,10 @@ interface RuntimeDispatchState {
 
 const runtimeDispatchState = new WeakMap<SessionRuntime, RuntimeDispatchState>()
 
+/**
+ * Test/utility hook to attach dispatch state manually. Production code
+ * never calls this directly — the dispatcher owns attachment.
+ */
 export function attachDispatchState(runtime: SessionRuntime, snapshot: RuntimeOptionsSnapshot): void {
   runtimeDispatchState.set(runtime, { snapshot })
 }
@@ -168,25 +178,41 @@ export async function* dispatchPersistentTurn(
   let runtime = await acquireOrCreateRuntime(req, deps)
 
   // --- Options drift check ---
+  // Dispatch state is attached by `acquireOrCreateRuntime` for every cold
+  // path, so it MUST be present here. A missing snapshot means either the
+  // runtime was created outside the dispatcher (bug) or the test harness
+  // constructed a runtime without the create path (test bug). Surface
+  // loudly — silent no-op would make drift detection invisibly broken.
   const state = runtimeDispatchState.get(runtime)
-  if (state) {
-    const drift = classifyOptionsDrift(
-      { reopenCritical: req.reopenCritical, inPlace: req.inPlace },
-      state.snapshot,
+  if (!state) {
+    throw new Error(
+      `dispatchPersistentTurn: runtime for ${req.profileSessionId} is missing ` +
+      `dispatch state; runtimes must be created via the dispatcher's ` +
+      `acquireOrCreateRuntime path or attachDispatchState must be called ` +
+      `explicitly in tests`,
     )
-    if (drift.hashMismatch) {
-      // Close the old runtime and cold-reattach with the new options.
-      await deps.manager.drop(req.profileSessionId)
-      runtime = await deps.createRuntime({
-        profileSessionId: req.profileSessionId,
-        reopenCritical: req.reopenCritical,
-        inPlace: req.inPlace,
-        resumeSessionId: runtime.claudeSessionId ?? req.resumeSessionIdFromCache,
-      })
-      deps.manager.put(runtime)
-    } else if (drift.inPlaceUpdates.length > 0) {
-      await applyInPlaceUpdates(runtime, drift.inPlaceUpdates)
-    }
+  }
+  const drift = classifyOptionsDrift(
+    { reopenCritical: req.reopenCritical, inPlace: req.inPlace },
+    state.snapshot,
+  )
+  if (drift.hashMismatch) {
+    // Close the old runtime and cold-reattach with the new options.
+    await deps.manager.drop(req.profileSessionId)
+    runtime = await createAndAttach(deps, {
+      profileSessionId: req.profileSessionId,
+      reopenCritical: req.reopenCritical,
+      inPlace: req.inPlace,
+      resumeSessionId: runtime.claudeSessionId ?? req.resumeSessionIdFromCache,
+    })
+    deps.manager.put(runtime)
+  } else if (drift.inPlaceUpdates.length > 0) {
+    await applyInPlaceUpdates(runtime, drift.inPlaceUpdates)
+    // Refresh the snapshot so the next turn compares against the just-applied
+    // in-place settings rather than the original create-time snapshot.
+    runtimeDispatchState.set(runtime, {
+      snapshot: snapshotOptions(req.reopenCritical, req.inPlace),
+    })
   }
 
   // --- Acquire turn mutex ---
@@ -230,7 +256,7 @@ async function acquireOrCreateRuntime(
   if (req.isUndo) {
     const existing = deps.manager.get(req.profileSessionId)
     if (existing) await deps.manager.drop(req.profileSessionId)
-    const runtime = await deps.createRuntime({
+    const runtime = await createAndAttach(deps, {
       profileSessionId: req.profileSessionId,
       reopenCritical: req.reopenCritical,
       inPlace: req.inPlace,
@@ -247,12 +273,28 @@ async function acquireOrCreateRuntime(
 
   // Cold reattach (§D5): if session/cache.ts knows the Claude SDK session id
   // but we don't have a live runtime for it, start a new query with resume.
-  const runtime = await deps.createRuntime({
+  const runtime = await createAndAttach(deps, {
     profileSessionId: req.profileSessionId,
     reopenCritical: req.reopenCritical,
     inPlace: req.inPlace,
     resumeSessionId: req.resumeSessionIdFromCache,
   })
   deps.manager.put(runtime)
+  return runtime
+}
+
+/**
+ * Wrapper around `deps.createRuntime` that attaches the dispatch-state
+ * snapshot immediately after creation. Centralising attachment here keeps
+ * the contract (dispatcher = single writer) enforceable.
+ */
+async function createAndAttach(
+  deps: DispatchDeps,
+  args: CreateRuntimeArgs,
+): Promise<SessionRuntime> {
+  const runtime = await deps.createRuntime(args)
+  runtimeDispatchState.set(runtime, {
+    snapshot: snapshotOptions(args.reopenCritical, args.inPlace),
+  })
   return runtime
 }

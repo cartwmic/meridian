@@ -12,9 +12,9 @@
 
 import { createSdkMcpServer } from "@anthropic-ai/claude-agent-sdk"
 import { z } from "zod"
+import { PASSTHROUGH_MCP_NAME, PASSTHROUGH_MCP_PREFIX, stripMcpPrefix } from "./passthroughConstants"
 
-export const PASSTHROUGH_MCP_NAME = "oc"
-export const PASSTHROUGH_MCP_PREFIX = `mcp__${PASSTHROUGH_MCP_NAME}__`
+export { PASSTHROUGH_MCP_NAME, PASSTHROUGH_MCP_PREFIX, stripMcpPrefix }
 
 /**
  * Convert a JSON Schema object to a Zod schema (simplified).
@@ -247,13 +247,3 @@ function stableStringify(value: unknown): string {
   return `{${parts.join(",")}}`
 }
 
-/**
- * Strip the MCP prefix from a tool name to get the OpenCode tool name.
- * e.g., "mcp__oc__todowrite" → "todowrite"
- */
-export function stripMcpPrefix(toolName: string): string {
-  if (toolName.startsWith(PASSTHROUGH_MCP_PREFIX)) {
-    return toolName.slice(PASSTHROUGH_MCP_PREFIX.length)
-  }
-  return toolName
-}

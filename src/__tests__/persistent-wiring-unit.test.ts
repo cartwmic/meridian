@@ -66,7 +66,11 @@ describe("buildHooksBinding", () => {
 })
 
 describe("makePersistentCreateRuntime", () => {
-  it("constructs a runtime with options snapshot and returns it", async () => {
+  it("constructs a runtime and returns it without attaching dispatch state", async () => {
+    // §3.17: the factory MUST NOT attach dispatch state; the dispatcher is
+    // the single writer. Snapshot attachment happens inside
+    // `dispatchPersistentTurn` (or an explicit `attachDispatchState` call
+    // in tests that skip the dispatcher).
     const { query } = createMockQuery({ turns: [{ events: [] as never[] }] })
     const startQueryCalls: Array<Options> = []
     const deps: PersistentWiringDeps = {
@@ -95,10 +99,8 @@ describe("makePersistentCreateRuntime", () => {
     expect(startQueryCalls).toHaveLength(1)
     expect((startQueryCalls[0] as any).model).toBe("claude-sonnet-4-5")
 
-    // The dispatch state should be attached so drift detection works on the next turn.
-    const state = getDispatchState(runtime)
-    expect(state).toBeDefined()
-    expect(state!.snapshot.reopenCriticalHash).toMatch(/^[0-9a-f]{16}$/)
+    // Factory does NOT attach dispatch state (dispatcher's job).
+    expect(getDispatchState(runtime)).toBeUndefined()
   })
 
   it("forwards resumeSessionId / forkSession / resumeSessionAt into the options builder", async () => {
@@ -125,6 +127,45 @@ describe("makePersistentCreateRuntime", () => {
     expect(capturedArgs.resumeSessionId).toBe("sdk-sess-123")
     expect(capturedArgs.forkSession).toBe(true)
     expect(capturedArgs.resumeSessionAt).toBe("uuid-rollback")
+  })
+
+  it("throws a clear error when passthrough spec is set but buildPassthroughBinding dep is missing (§3.18)", async () => {
+    const { query } = createMockQuery({ turns: [{ events: [] as never[] }] })
+    const deps: PersistentWiringDeps = {
+      startQuery: () => query as Query,
+      buildOptions: () => ({} as Options),
+      getPassthroughSpec: () => ({ tools: [{ name: "read" }] }),
+      // buildPassthroughBinding intentionally omitted
+    }
+    const createRuntime = makePersistentCreateRuntime(deps)
+    await expect(createRuntime({
+      profileSessionId: "session-A",
+      reopenCritical: baseReopen,
+      inPlace: baseInPlace,
+    })).rejects.toThrow(/buildPassthroughBinding was not provided/)
+  })
+
+  it("calls the supplied buildPassthroughBinding with the spec and runtimeRef (§3.18)", async () => {
+    const { query } = createMockQuery({ turns: [{ events: [] as never[] }] })
+    const calls: Array<{ spec: any; runtimeRef: RuntimeRef }> = []
+    const deps: PersistentWiringDeps = {
+      startQuery: () => query as Query,
+      buildOptions: () => ({} as Options),
+      getPassthroughSpec: () => ({ tools: [{ name: "read" }] }),
+      buildPassthroughBinding: (spec, runtimeRef) => {
+        calls.push({ spec, runtimeRef })
+        return { mcpServers: {}, allowedTools: [], hasDeferredTools: false }
+      },
+    }
+    const createRuntime = makePersistentCreateRuntime(deps)
+    await createRuntime({
+      profileSessionId: "session-A",
+      reopenCritical: baseReopen,
+      inPlace: baseInPlace,
+    })
+    expect(calls).toHaveLength(1)
+    expect(calls[0]!.spec.tools).toEqual([{ name: "read" }])
+    expect(calls[0]!.runtimeRef.current).not.toBeNull()
   })
 
   it("binds the PreToolUse hook so it can reach the runtime after construction (late-binding)", async () => {

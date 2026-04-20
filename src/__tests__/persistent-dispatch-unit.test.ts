@@ -9,13 +9,12 @@ import {
   type SessionRuntime,
 } from "../proxy/session/runtime"
 import {
-  attachDispatchState,
   dispatchPersistentTurn,
   type CreateRuntimeArgs,
   type CreateRuntimeFn,
   type PersistentTurnRequest,
 } from "../proxy/session/persistentDispatch"
-import { snapshotOptions, type InPlaceOptions } from "../proxy/session/optionsClassifier"
+import { type InPlaceOptions } from "../proxy/session/optionsClassifier"
 import { createMockQuery, pushUserMessage } from "./helpers/mockQuery"
 
 // --- Test harness ----------------------------------------------------------
@@ -69,11 +68,11 @@ function makeHarness(): TestHarness {
     })()
     const runtime = createSessionRuntime({
       profileSessionId: args.profileSessionId,
-      optionsHash: "h",
       query: query as Query,
       inputQueue,
     })
-    attachDispatchState(runtime, snapshotOptions(args.reopenCritical, args.inPlace))
+    // §3.17: dispatcher attaches dispatch state on first creation; the test
+    // harness does not need to call attachDispatchState.
     runtimes.push(runtime)
     return runtime
   }

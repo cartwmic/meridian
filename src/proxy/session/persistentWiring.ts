@@ -22,14 +22,13 @@ import {
   type ReopenCriticalOptions,
 } from "./runtime"
 import {
-  attachDispatchState,
   type CreateRuntimeArgs,
   type CreateRuntimeFn,
 } from "./persistentDispatch"
 import {
-  snapshotOptions,
   type InPlaceOptions,
 } from "./optionsClassifier"
+import { stripMcpPrefix } from "../passthroughConstants"
 
 // --- Types -----------------------------------------------------------------
 
@@ -71,6 +70,19 @@ export interface PersistentWiringDeps {
    * populates the runtime's tool_use_id FIFO. When off, neither is wired.
    */
   getPassthroughSpec: () => PassthroughSpec | null
+
+  /**
+   * Construct the passthrough MCP binding for a given spec + runtime
+   * reference. REQUIRED when `getPassthroughSpec` may return non-null —
+   * omitting it while passthrough is on would crash at the first tool_use.
+   * Kept as a dep (rather than a module-level helper) so server.ts supplies
+   * the real `createPassthroughMcpServer(..., { deferredMode })` factory
+   * while tests substitute a no-op binding.
+   */
+  buildPassthroughBinding?: (
+    spec: PassthroughSpec,
+    runtimeRef: RuntimeRef,
+  ) => PassthroughMcpBinding
 }
 
 /** Late-bound reference to the runtime that the MCP handlers close over. */
@@ -115,8 +127,15 @@ export function makePersistentCreateRuntime(deps: PersistentWiringDeps): CreateR
     const runtimeRef: RuntimeRef = { current: null }
 
     const passthroughSpec = deps.getPassthroughSpec()
-    const passthroughMcpBinding = passthroughSpec
-      ? buildPassthroughBinding(passthroughSpec, runtimeRef)
+    if (passthroughSpec && !deps.buildPassthroughBinding) {
+      throw new Error(
+        "persistentWiring: getPassthroughSpec returned a spec but " +
+        "buildPassthroughBinding was not provided — server.ts MUST supply " +
+        "a deferredMode-compatible MCP factory when passthrough is on",
+      )
+    }
+    const passthroughMcpBinding = passthroughSpec && deps.buildPassthroughBinding
+      ? deps.buildPassthroughBinding(passthroughSpec, runtimeRef)
       : undefined
     const sdkHooksBinding = passthroughSpec
       ? buildHooksBinding(runtimeRef)
@@ -136,42 +155,21 @@ export function makePersistentCreateRuntime(deps: PersistentWiringDeps): CreateR
 
     const runtime = createSessionRuntime({
       profileSessionId: args.profileSessionId,
-      optionsHash: "persistent", // dispatcher checks snapshot state, not this
       query,
       inputQueue,
     })
 
     // Bind the late reference so MCP handlers + hook can now reach runtime.
+    // Dispatcher attaches the options snapshot via `attachDispatchState` on
+    // first touch (see persistentDispatch.ts); factories MUST NOT attach
+    // state themselves — single-owner contract.
     runtimeRef.current = runtime
-
-    // Attach the snapshot the dispatcher's drift detection consults.
-    attachDispatchState(runtime, snapshotOptions(args.reopenCritical, args.inPlace))
 
     return runtime
   }
 }
 
-// --- Passthrough binding construction --------------------------------------
-
-/**
- * Build the passthrough MCP + deferred handler binding. The MCP handlers
- * reach the runtime via `runtimeRef.current`, which the factory above
- * populates immediately after the runtime is constructed.
- */
-export function buildPassthroughBinding(
-  _spec: PassthroughSpec,
-  _runtimeRef: RuntimeRef,
-): PassthroughMcpBinding {
-  // The actual MCP construction happens in the server wiring because it
-  // needs the @anthropic-ai/claude-agent-sdk `createSdkMcpServer` which
-  // pulls in real subprocess behaviour. This stub returns a placeholder
-  // that server.ts will replace with `createPassthroughMcpServer(spec.tools,
-  // spec.coreToolNames, { deferredMode: {...} })` when integrating.
-  //
-  // Leaving this as an extension point keeps this module test-friendly:
-  // tests pass a no-op binding; production wires the real MCP here.
-  throw new Error("buildPassthroughBinding: server.ts must override or supply a deferredMode-compatible MCP binding")
-}
+// --- SDK hook binding -----------------------------------------------------
 
 /**
  * Build the `sdkHooks.PreToolUse` binding that captures tool_use_ids into
@@ -190,7 +188,7 @@ export function buildHooksBinding(runtimeRef: RuntimeRef): SdkHooksBinding {
     // starts), silently no-op.
     const runtime = runtimeRef.current
     if (runtime && typeof input.tool_use_id === "string" && typeof input.tool_name === "string") {
-      const toolName = stripMcpPrefixLocal(input.tool_name)
+      const toolName = stripMcpPrefix(input.tool_name)
       runtime.enqueueToolUseId(toolName, input.tool_use_id)
     }
 
@@ -206,18 +204,4 @@ export function buildHooksBinding(runtimeRef: RuntimeRef): SdkHooksBinding {
       PreToolUse: [{ matcher: "", hooks: [hook] }],
     } as unknown as Options["hooks"],
   }
-}
-
-// --- Helpers ---------------------------------------------------------------
-
-/**
- * Local copy of `stripMcpPrefix` to avoid a circular import from
- * `passthroughTools.ts`. Kept in sync with that module's `PASSTHROUGH_MCP_PREFIX`.
- */
-function stripMcpPrefixLocal(toolName: string): string {
-  const PASSTHROUGH_MCP_PREFIX = "mcp__oc__"
-  if (toolName.startsWith(PASSTHROUGH_MCP_PREFIX)) {
-    return toolName.slice(PASSTHROUGH_MCP_PREFIX.length)
-  }
-  return toolName
 }

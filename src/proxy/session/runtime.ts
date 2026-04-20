@@ -22,20 +22,72 @@ export interface AsyncQueue<T> extends AsyncIterable<T> {
   push(value: T): void
   close(): void
   readonly closed: boolean
+  /** Current buffered depth — useful for telemetry. */
+  readonly depth: number
 }
 
-export function createAsyncQueue<T>(): AsyncQueue<T> {
+export interface AsyncQueueOptions {
+  /**
+   * Soft high-water mark. When buffered depth crosses this threshold,
+   * `onHighWater` fires with the current depth so the caller can emit
+   * telemetry. Pushes continue to succeed.
+   */
+  highWaterMark?: number
+  /**
+   * Hard cap. Pushes beyond this throw `AsyncQueueOverflowError`. The
+   * caller is expected to translate the throw into HTTP 503 or equivalent
+   * backpressure at the request boundary. Default `Infinity` (unbounded).
+   */
+  hardCap?: number
+  /**
+   * Invoked whenever a push crosses `highWaterMark` upward. No-op by
+   * default. `depth` is the post-push buffered size.
+   */
+  onHighWater?: (depth: number) => void
+}
+
+export class AsyncQueueOverflowError extends Error {
+  readonly depth: number
+  readonly hardCap: number
+  constructor(depth: number, hardCap: number) {
+    super(`AsyncQueue push rejected: depth ${depth} would exceed hardCap ${hardCap}`)
+    this.name = "AsyncQueueOverflowError"
+    this.depth = depth
+    this.hardCap = hardCap
+  }
+}
+
+export function createAsyncQueue<T>(opts: AsyncQueueOptions = {}): AsyncQueue<T> {
   const buffer: T[] = []
   const waiters: Array<(value: IteratorResult<T>) => void> = []
   let closed = false
+  const highWaterMark = opts.highWaterMark ?? Infinity
+  const hardCap = opts.hardCap ?? Infinity
+  const onHighWater = opts.onHighWater
+  let aboveHighWater = false
 
   return {
     get closed() { return closed },
+    get depth() { return buffer.length },
     push(value: T): void {
       if (closed) return
       const waiter = waiters.shift()
-      if (waiter) waiter({ value, done: false })
-      else buffer.push(value)
+      if (waiter) {
+        waiter({ value, done: false })
+        return
+      }
+      if (buffer.length >= hardCap) {
+        throw new AsyncQueueOverflowError(buffer.length + 1, hardCap)
+      }
+      buffer.push(value)
+      if (buffer.length > highWaterMark) {
+        if (!aboveHighWater) {
+          aboveHighWater = true
+          try { onHighWater?.(buffer.length) } catch { /* swallow telemetry errors */ }
+        }
+      } else {
+        aboveHighWater = false
+      }
     },
     close(): void {
       if (closed) return
@@ -45,9 +97,15 @@ export function createAsyncQueue<T>(): AsyncQueue<T> {
     [Symbol.asyncIterator](): AsyncIterator<T> {
       return {
         next: () => new Promise((resolve) => {
-          if (buffer.length) resolve({ value: buffer.shift()!, done: false })
-          else if (closed) resolve({ value: undefined as unknown as T, done: true })
-          else waiters.push(resolve)
+          if (buffer.length) {
+            const value = buffer.shift()!
+            if (buffer.length <= highWaterMark) aboveHighWater = false
+            resolve({ value, done: false })
+          } else if (closed) {
+            resolve({ value: undefined as unknown as T, done: true })
+          } else {
+            waiters.push(resolve)
+          }
         }),
       }
     },
@@ -205,7 +263,14 @@ export function classifyPassthroughRequest(
   pendingToolUseIds: ReadonlySet<string>,
 ): PassthroughClassification {
   if (!Array.isArray(content)) {
-    return { resolve: [], pushContent: content === undefined ? null : [] }
+    // Non-array content: `null` / `undefined` → nothing to push; string or
+    // single-object block → wrap in a one-element array so the payload
+    // survives. No `tool_result` matching happens here because `tool_result`
+    // correlation requires the canonical content-block array shape.
+    if (content === undefined || content === null) {
+      return { resolve: [], pushContent: null }
+    }
+    return { resolve: [], pushContent: [content] }
   }
   const resolve: Array<{ toolUseId: string; content: string }> = []
   const remainder: unknown[] = []
@@ -228,7 +293,13 @@ export function classifyPassthroughRequest(
 
 export interface SessionRuntimeInit {
   profileSessionId: string
-  optionsHash: string
+  /**
+   * Legacy options-hash field. Kept for test fixtures and back-compat but
+   * unused by the dispatcher — drift detection goes through
+   * `attachDispatchState`/`getDispatchState` on a per-runtime WeakMap. Safe
+   * to omit.
+   */
+  optionsHash?: string
   query: Query
   inputQueue: AsyncQueue<SDKUserMessage>
   onCrash?: (err: unknown) => void
@@ -248,6 +319,8 @@ export interface SessionRuntime {
   closed: boolean
   /** Serializes pushTurn calls — only one turn per runtime at a time. */
   acquireTurn(timeoutMs?: number): Promise<() => void>
+  /** True when a turn currently holds the per-runtime mutex. */
+  readonly turnInFlight: boolean
   /**
    * Read events for the current turn until the turn terminator is observed.
    * The caller MUST hold the mutex (via acquireTurn) before calling this.
@@ -306,7 +379,7 @@ export function createSessionRuntime(init: SessionRuntimeInit): SessionRuntime {
 
   const runtime: SessionRuntime = {
     profileSessionId: init.profileSessionId,
-    optionsHash: init.optionsHash,
+    optionsHash: init.optionsHash ?? "",
     inputQueue: init.inputQueue,
     query: init.query,
     get claudeSessionId() { return claudeSessionId },
@@ -319,6 +392,7 @@ export function createSessionRuntime(init: SessionRuntimeInit): SessionRuntime {
       const release = await mutex.acquire(timeoutMs)
       return release
     },
+    get turnInFlight(): boolean { return mutex.locked },
     async *consumeTurn(): AsyncIterable<SDKMessage> {
       try {
         while (true) {
@@ -440,7 +514,10 @@ export function createSessionRuntimeManager(config: SessionRuntimeManagerConfig)
   const now = config.now ?? (() => Date.now())
 
   const map = new LRUMap<string, SessionRuntime>(config.maxLive, (_key, evicted) => {
-    void evicted.close()
+    // Fire-and-forget close on LRU eviction; swallow errors so a throwing
+    // close (e.g. SDK subprocess already dead) doesn't produce an
+    // unhandled-rejection.
+    evicted.close().catch(() => {})
   })
 
   const manager: SessionRuntimeManager = {
@@ -467,11 +544,18 @@ export function createSessionRuntimeManager(config: SessionRuntimeManagerConfig)
       const cutoff = now() - config.idleMs
       const toEvict: string[] = []
       for (const [key, runtime] of map.entries()) {
+        // Skip runtimes currently serving a turn — evicting mid-turn would
+        // close the SDK query out from under the holder. The next sweep
+        // pass will catch it once the turn releases.
+        if (runtime.turnInFlight) continue
         if (runtime.lastActivity < cutoff) toEvict.push(key)
       }
       for (const key of toEvict) {
         const r = map.get(key)
         if (!r) continue
+        // Re-check turnInFlight just before dropping; a request may have
+        // raced in between the scan and now.
+        if (r.turnInFlight) continue
         map.delete(key)
         await r.close()
       }
