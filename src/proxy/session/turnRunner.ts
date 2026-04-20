@@ -20,6 +20,7 @@ import { query as sdkQuery, type Options, type Query, type SDKMessage, type SDKU
 import type { ProxyConfig } from "../types"
 import { buildQueryOptions, type QueryContext } from "../query"
 import { createPassthroughMcpServer, PASSTHROUGH_MCP_NAME } from "../passthroughTools"
+import { claudeLog } from "../../logger"
 import {
   type SessionRuntimeManager,
   type ReopenCriticalOptions,
@@ -110,9 +111,20 @@ function extractInPlace(options: Options): InPlaceOptions {
  * iterates `query(...)` — there is no additional framing.
  */
 export function startTurn(ctx: TurnContext, deps: TurnRunnerDeps): AsyncIterable<SDKMessage> {
-  if (deps.config.persistentSessions && !ctx.isUndo && typeof ctx.profileSessionId === "string" && ctx.profileSessionId.length > 0) {
+  // §8.1 — adapter-scoped override. When the adapter defines
+  // `usesPersistentSessions` and returns a non-undefined value, it takes
+  // precedence over the global `config.persistentSessions`.
+  const adapterOverride = ctx.adapter.usesPersistentSessions?.()
+  const flagOn = adapterOverride !== undefined ? adapterOverride : !!deps.config.persistentSessions
+  if (flagOn && !ctx.isUndo && typeof ctx.profileSessionId === "string" && ctx.profileSessionId.length > 0) {
     return runPersistent(ctx as TurnContext & { profileSessionId: string }, deps)
   }
+  claudeLog("persistent.turn", {
+    mode: "resume",
+    profileSessionId: ctx.profileSessionId ?? null,
+    stream: ctx.stream,
+    reason: !flagOn ? "flag_off" : ctx.isUndo ? "undo" : "no_session_id",
+  })
   const { prompt, options } = buildQueryOptions(ctx)
   return sdkQuery({ prompt, options })
 }
@@ -121,6 +133,7 @@ async function* runPersistent(ctx: TurnContext & { profileSessionId: string }, d
   const passthroughSpec: PassthroughSpec | null = ctx.passthroughSpec ?? null
 
   const wiringDeps: PersistentWiringDeps = {
+    pendingExecutionTimeoutMs: deps.config.persistentPendingExecutionTimeoutMs,
     startQuery: ({ inputQueue, options }) => sdkQuery({ prompt: inputQueue as AsyncIterable<SDKUserMessage>, options }) as Query,
     buildOptions: ({ reopenCritical, inPlace, resumeSessionId, forkSession, resumeSessionAt, passthroughMcpBinding, sdkHooksBinding }) => {
       // Re-run buildQueryOptions with a ctx that reflects the
@@ -185,9 +198,20 @@ async function* runPersistent(ctx: TurnContext & { profileSessionId: string }, d
   // wiring deps will rebuild per turn inside the dispatcher.
   const { options } = buildQueryOptions(ctx)
   const reopenCritical = extractReopenCritical(options, passthroughSpec)
-  // Hash the critical options so the dispatcher can check drift cheaply.
-  void hashReopenCriticalOptions(reopenCritical)
+  // Hash the critical options so the dispatcher can check drift cheaply
+  // and so §2.1 cache-trace can attribute reopens.
+  const optionsHashReopenCritical = hashReopenCriticalOptions(reopenCritical)
   const inPlace = extractInPlace(options)
+
+  // §7.1/§2.1 — emit a per-turn tag that downstream trace tooling can
+  // pick up. `mode: "persistent"` distinguishes this code path from the
+  // legacy `resume`-based one.
+  claudeLog("persistent.turn", {
+    mode: "persistent",
+    profileSessionId: ctx.profileSessionId,
+    optionsHashReopenCritical,
+    stream: ctx.stream,
+  })
 
   const req: PersistentTurnRequest = {
     profileSessionId: ctx.profileSessionId,
@@ -197,6 +221,7 @@ async function* runPersistent(ctx: TurnContext & { profileSessionId: string }, d
     isUndo: ctx.isUndo,
     undoRollbackUuid: ctx.undoRollbackUuid,
     resumeSessionIdFromCache: ctx.resumeSessionId,
+    mutexWaitMs: deps.config.persistentSessionMutexWaitMs,
   }
 
   let firstSessionIdSeen = false

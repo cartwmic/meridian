@@ -83,6 +83,15 @@ export interface PersistentWiringDeps {
     spec: PassthroughSpec,
     runtimeRef: RuntimeRef,
   ) => PassthroughMcpBinding
+
+  /**
+   * Forwarded to `createSessionRuntime` as `pendingExecutionTimeoutMs`
+   * — the idle-timeout (ms) for pending deferred-handler promises. When a
+   * client abandons a tool call, the handler rejects after this interval
+   * so the SDK unblocks and the runtime can be recovered or evicted
+   * (§5.12f). Default `Infinity` (no timeout).
+   */
+  pendingExecutionTimeoutMs?: number
 }
 
 /** Late-bound reference to the runtime that the MCP handlers close over. */
@@ -157,6 +166,7 @@ export function makePersistentCreateRuntime(deps: PersistentWiringDeps): CreateR
       profileSessionId: args.profileSessionId,
       query,
       inputQueue,
+      pendingExecutionTimeoutMs: deps.pendingExecutionTimeoutMs,
     })
 
     // Bind the late reference so MCP handlers + hook can now reach runtime.

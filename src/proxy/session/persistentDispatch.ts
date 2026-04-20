@@ -55,6 +55,24 @@ export interface PersistentTurnRequest {
   undoRollbackUuid?: string
   /** Claude SDK session id from session/cache.ts when cold-reattach is needed. */
   resumeSessionIdFromCache?: string
+  /**
+   * Optional per-turn mutex-acquisition timeout (ms). Requests that queue
+   * behind another turn longer than this get a `MutexAcquireTimeoutError`
+   * surfaced to the caller; server.ts translates that into HTTP 429 +
+   * Retry-After (§5.10).
+   */
+  mutexWaitMs?: number
+}
+
+export class MutexAcquireTimeoutError extends Error {
+  readonly profileSessionId: string
+  readonly timeoutMs: number
+  constructor(profileSessionId: string, timeoutMs: number) {
+    super(`persistent-session mutex acquire for ${profileSessionId} timed out after ${timeoutMs}ms`)
+    this.name = "MutexAcquireTimeoutError"
+    this.profileSessionId = profileSessionId
+    this.timeoutMs = timeoutMs
+  }
 }
 
 export interface CreateRuntimeArgs {
@@ -206,6 +224,7 @@ export async function* dispatchPersistentTurn(
       resumeSessionId: runtime.claudeSessionId ?? req.resumeSessionIdFromCache,
     })
     deps.manager.put(runtime)
+    deps.manager.emitLifecycle("reopen", req.profileSessionId)
   } else if (drift.inPlaceUpdates.length > 0) {
     await applyInPlaceUpdates(runtime, drift.inPlaceUpdates)
     // Refresh the snapshot so the next turn compares against the just-applied
@@ -216,7 +235,17 @@ export async function* dispatchPersistentTurn(
   }
 
   // --- Acquire turn mutex ---
-  const release = await runtime.acquireTurn()
+  let release: () => void
+  try {
+    release = await runtime.acquireTurn(req.mutexWaitMs)
+  } catch (err) {
+    // Mutex.acquire rejects with a generic Error on timeout; surface as a
+    // typed error so server.ts can translate to HTTP 429 (§5.10).
+    if (err instanceof Error && /Mutex acquire timed out/.test(err.message) && req.mutexWaitMs !== undefined) {
+      throw new MutexAcquireTimeoutError(req.profileSessionId, req.mutexWaitMs)
+    }
+    throw err
+  }
   try {
     // --- Classify request content: resolve pending OR push ---
     const classification = classifyPassthroughRequest(

@@ -2892,3 +2892,45 @@ print(f'Modes seen: {modes}  PASS')
 **Pass criteria:**
 - At least 2 new telemetry request records after the two requests
 - Both streaming and non-streaming modes recorded
+
+---
+
+## Persistent-SDK-sessions mode (§10.6)
+
+Run these once with `MERIDIAN_PERSISTENT_SESSIONS=1` (or `ProxyConfig.persistentSessions: true`) before enabling the flag by default. The suite validates the four cache / lineage invariants that persistent mode promises.
+
+### P1. Warm-turn cache hit
+
+Start the proxy with persistent mode on, make two user turns on the same session, confirm turn 2's `cacheReadInputTokens > 0`.
+
+```bash
+curl -s -X POST http://127.0.0.1:3456/v1/messages \
+  -H "Content-Type: application/json" -H "x-api-key: dummy" \
+  -d '{"model":"claude-sonnet-4-5","max_tokens":50,
+       "messages":[{"role":"user","content":"turn 1"}]}' | tee /tmp/persist_t1.json
+curl -s -X POST http://127.0.0.1:3456/v1/messages \
+  -H "Content-Type: application/json" -H "x-api-key: dummy" \
+  -d '{"model":"claude-sonnet-4-5","max_tokens":50,
+       "messages":[{"role":"user","content":"turn 1"},{"role":"assistant","content":"..."},{"role":"user","content":"turn 2"}]}' | tee /tmp/persist_t2.json
+```
+
+**Pass criteria:** T2 cacheRead > 0; `claudeLog` emits `persistent.turn { mode: "persistent" }` on both requests.
+
+### P2. Cold-reattach after restart
+
+Restart the proxy between turns; the second turn must cold-reattach via `resume` and show `cacheReadInputTokens: 0` on the reattach turn, then cache on the turn after.
+
+### P3. Undo preserves lineage
+
+Undo on a warm runtime must match today's `query({ resume, forkSession: true, resumeSessionAt })` path byte-for-byte. Undo falls through to legacy in persistent mode (§5.4), so equivalence is structural.
+
+### P4. Pi client-executed-tool pairing
+
+Live Pi session (passthrough on) — verify:
+1. Turn 1 emits tool_use blocks to the client
+2. Client returns with `tool_result` blocks
+3. SDK receives the real `tool_result` as the MCP handler's return value
+4. Final assistant content references the real tool output (not a sentinel)
+5. Turn 2 cacheRead > 0
+
+Deferred handlers time out after `config.persistentPendingExecutionTimeoutMs` if the client abandons the call.

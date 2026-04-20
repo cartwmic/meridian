@@ -48,16 +48,23 @@ src/
 │   ├── messages.ts            ← Content normalization, message parsing
 │   ├── types.ts               ← ProxyConfig, ProxyInstance, ProxyServer types
 │   ├── session/
-│   │   ├── index.ts           ← Barrel export
-│   │   ├── lineage.ts         ← Pure functions: hashing, lineage verification
-│   │   ├── fingerprint.ts     ← Conversation fingerprinting, client CWD extraction
-│   │   └── cache.ts           ← LRU session caches, lookup/store operations
+│   │   ├── index.ts                ← Barrel export
+│   │   ├── lineage.ts              ← Pure functions: hashing, lineage verification
+│   │   ├── fingerprint.ts          ← Conversation fingerprinting, client CWD extraction
+│   │   ├── cache.ts                ← LRU session caches, lookup/store operations
+│   │   ├── runtime.ts              ← SessionRuntime + SessionRuntimeManager (persistent mode): one live SDK query() per logical session, streaming-input queue, LRU eviction, mutex, pending-handler registry, lifecycle events, counters
+│   │   ├── optionsClassifier.ts    ← Pure drift classifier: reopen-critical hash vs in-place setModel/applyFlagSettings updates
+│   │   ├── persistentDispatch.ts   ← Dispatches one persistent-mode turn: drift check → mutex → classify + resolve/push → consume events. Owns attachDispatchState contract.
+│   │   ├── persistentWiring.ts     ← Constructs `CreateRuntimeFn` for the dispatcher: startQuery, buildOptions, passthrough/hooks bindings
+│   │   └── turnRunner.ts           ← Single entry point server.ts calls in place of query(buildQueryOptions(...)); branches on `persistentSessions` flag + adapter override
+│   ├── contentSanitizer.ts     ← stripCacheControl for persistent-mode push invariant (§D10)
 │   ├── sessionStore.ts        ← Shared file store (cross-proxy session resume)
 │   ├── profiles.ts            ← Multi-profile support: resolve, list, switch auth contexts (leaf)
 │   ├── profileCli.ts          ← CLI commands for profile management (leaf, I/O)
 │   ├── agentDefs.ts           ← Subagent definition extraction from tool descriptions
 │   ├── agentMatch.ts          ← Fuzzy agent name matching
-│   └── passthroughTools.ts    ← Tool forwarding mode (agent handles execution)
+│   ├── passthroughTools.ts    ← Tool forwarding mode (agent handles execution)
+│   └── passthroughConstants.ts← Leaf module: PASSTHROUGH_MCP_NAME/PREFIX + stripMcpPrefix (shared with session/persistentWiring)
 ├── fileChanges.ts             ← PostToolUse hook: tracks write/edit ops, formats summary
 ├── mcpTools.ts                ← MCP tool definitions (read, write, edit, bash, glob, grep)
 ├── logger.ts                  ← Logging with AsyncLocalStorage context

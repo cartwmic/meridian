@@ -156,6 +156,18 @@ export interface AgentAdapter {
   leaksCwdViaSystemReminder?(): boolean
 
   /**
+   * Whether this adapter participates in persistent-SDK-sessions mode
+   * (§8.1 — adapter-scoped flag override). When defined, the return value
+   * takes precedence over the global `config.persistentSessions` for
+   * requests routed through this adapter. Undefined defers to the global.
+   *
+   * Rollout sequence (design §D9): OpenCode-first, then Pi, then the rest.
+   * Flipping this per-adapter lets each adapter opt in independently
+   * without coordinated deploys.
+   */
+  usesPersistentSessions?(): boolean | undefined
+
+  /**
    * Map a client-side tool_use block to file changes (passthrough mode).
    *
    * In passthrough mode the SDK doesn't execute tools, so PostToolUse

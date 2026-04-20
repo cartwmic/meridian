@@ -305,6 +305,13 @@ export interface SessionRuntimeInit {
   onCrash?: (err: unknown) => void
   /** Current time source — overridable in tests. */
   now?: () => number
+  /**
+   * Idle timeout (ms) for pending deferred-handler promises. When a client
+   * abandons a tool call (never returns with tool_result), the handler
+   * rejects after this interval so the SDK unblocks + runtime can be
+   * recovered or evicted (§5.12f). Default `Infinity` (no timeout).
+   */
+  pendingExecutionTimeoutMs?: number
 }
 
 export interface SessionRuntime {
@@ -374,6 +381,9 @@ export function createSessionRuntime(init: SessionRuntimeInit): SessionRuntime {
 
   // Pending deferred handlers for passthrough tool execution.
   const pending = new Map<string, PendingExecution>()
+  // Active idle-timeout handles, keyed by tool_use_id (§5.12f).
+  const pendingTimeouts = new Map<string, ReturnType<typeof setTimeout>>()
+  const pendingTimeoutMs = init.pendingExecutionTimeoutMs ?? Infinity
   // Per-tool-name FIFO of captured tool_use_ids (PreToolUse → MCP handler).
   const toolUseIdFifo = new Map<string, string[]>()
 
@@ -421,6 +431,9 @@ export function createSessionRuntime(init: SessionRuntimeInit): SessionRuntime {
         try { entry.reject(new Error("SessionRuntime closed")) } catch { /* ignore */ }
       }
       pending.clear()
+      // Clear outstanding idle timers (§5.12f) so they don't fire post-close.
+      for (const [, h] of pendingTimeouts) clearTimeout(h)
+      pendingTimeouts.clear()
       try { init.query.close() } catch { /* ignore */ }
       init.inputQueue.close()
     },
@@ -430,18 +443,38 @@ export function createSessionRuntime(init: SessionRuntimeInit): SessionRuntime {
         throw new Error(`SessionRuntime ${init.profileSessionId} is closed`)
       }
       return await new Promise<string>((resolve, reject) => {
+        const clearIdleTimer = () => {
+          const h = pendingTimeouts.get(toolUseId)
+          if (h) {
+            clearTimeout(h)
+            pendingTimeouts.delete(toolUseId)
+          }
+        }
         pending.set(toolUseId, {
           toolUseId,
           createdAt: now(),
           resolve: (content: string) => {
+            clearIdleTimer()
             pending.delete(toolUseId)
             resolve(content)
           },
           reject: (err: unknown) => {
+            clearIdleTimer()
             pending.delete(toolUseId)
             reject(err instanceof Error ? err : new Error(String(err)))
           },
         })
+        if (Number.isFinite(pendingTimeoutMs)) {
+          const handle = setTimeout(() => {
+            const entry = pending.get(toolUseId)
+            if (!entry) return
+            entry.reject(new Error(
+              `pending deferred handler for tool_use_id ${toolUseId} timed out after ${pendingTimeoutMs}ms`,
+            ))
+          }, pendingTimeoutMs)
+          if ((handle as NodeJS.Timeout).unref) (handle as NodeJS.Timeout).unref()
+          pendingTimeouts.set(toolUseId, handle)
+        }
       })
     },
 
@@ -465,6 +498,9 @@ export function createSessionRuntime(init: SessionRuntimeInit): SessionRuntime {
         try { entry.reject(err) } catch { /* ignore */ }
       }
       pending.clear()
+      // Clear any outstanding idle timers so they don't fire post-close.
+      for (const [, h] of pendingTimeouts) clearTimeout(h)
+      pendingTimeouts.clear()
       return count
     },
 
@@ -495,10 +531,33 @@ export function createSessionRuntime(init: SessionRuntimeInit): SessionRuntime {
 
 // --- SessionRuntimeManager ---
 
+export type RuntimeLifecycleEvent =
+  | "create"
+  | "reattach"
+  | "reopen"
+  | "evict"
+  | "close"
+  | "crash-recover"
+
+export interface RuntimeLifecycleCounters {
+  live: number
+  creates: number
+  evictions: number
+  reopens: number
+  crashRecovers: number
+}
+
 export interface SessionRuntimeManagerConfig {
   idleMs: number
   maxLive: number
   now?: () => number
+  /**
+   * Observability hook — fires on every runtime lifecycle transition
+   * (create / reattach / reopen / evict / close / crash-recover). No-op by
+   * default. Consumers wire this to the existing log / trace channel
+   * (§7.2).
+   */
+  onLifecycle?: (event: RuntimeLifecycleEvent, profileSessionId: string) => void
 }
 
 export interface SessionRuntimeManager {
@@ -508,12 +567,36 @@ export interface SessionRuntimeManager {
   size: number
   sweepIdle(): Promise<number>
   closeAll(timeoutMs?: number): Promise<void>
+  /** Telemetry snapshot of cumulative counters (§7.3). */
+  readonly counters: RuntimeLifecycleCounters
+  /** Emit a custom lifecycle event (used by the dispatcher for `reopen`). */
+  emitLifecycle(event: RuntimeLifecycleEvent, profileSessionId: string): void
 }
 
 export function createSessionRuntimeManager(config: SessionRuntimeManagerConfig): SessionRuntimeManager {
   const now = config.now ?? (() => Date.now())
+  const counters: RuntimeLifecycleCounters = {
+    live: 0,
+    creates: 0,
+    evictions: 0,
+    reopens: 0,
+    crashRecovers: 0,
+  }
+  const emit = (event: RuntimeLifecycleEvent, profileSessionId: string) => {
+    switch (event) {
+      case "create": counters.creates++; break
+      case "reopen": counters.reopens++; break
+      case "evict": counters.evictions++; break
+      case "crash-recover": counters.crashRecovers++; break
+      // `reattach` + `close` don't bump creates/evictions — they're
+      // transitions observable via `live` changes alone.
+    }
+    try { config.onLifecycle?.(event, profileSessionId) } catch { /* swallow telemetry errors */ }
+  }
 
-  const map = new LRUMap<string, SessionRuntime>(config.maxLive, (_key, evicted) => {
+  const map = new LRUMap<string, SessionRuntime>(config.maxLive, (key, evicted) => {
+    counters.live = Math.max(0, counters.live - 1)
+    emit("evict", key)
     // Fire-and-forget close on LRU eviction; swallow errors so a throwing
     // close (e.g. SDK subprocess already dead) doesn't produce an
     // unhandled-rejection.
@@ -526,17 +609,27 @@ export function createSessionRuntimeManager(config: SessionRuntimeManagerConfig)
       if (!r) return undefined
       if (r.closed) {
         map.delete(profileSessionId)
+        counters.live = Math.max(0, counters.live - 1)
         return undefined
       }
       return r
     },
     put(runtime: SessionRuntime): void {
+      const existing = map.get(runtime.profileSessionId)
       map.set(runtime.profileSessionId, runtime)
+      if (!existing) {
+        counters.live++
+        emit("create", runtime.profileSessionId)
+      } else {
+        emit("reattach", runtime.profileSessionId)
+      }
     },
     async drop(profileSessionId: string): Promise<void> {
       const r = map.get(profileSessionId)
       if (!r) return
       map.delete(profileSessionId)
+      counters.live = Math.max(0, counters.live - 1)
+      emit("close", profileSessionId)
       await r.close()
     },
     get size(): number { return map.size },
@@ -557,6 +650,8 @@ export function createSessionRuntimeManager(config: SessionRuntimeManagerConfig)
         // raced in between the scan and now.
         if (r.turnInFlight) continue
         map.delete(key)
+        counters.live = Math.max(0, counters.live - 1)
+        emit("evict", key)
         await r.close()
       }
       return toEvict.length
@@ -564,10 +659,18 @@ export function createSessionRuntimeManager(config: SessionRuntimeManagerConfig)
     async closeAll(timeoutMs = 10_000): Promise<void> {
       const all = [...map.values()]
       map.clear()
+      counters.live = 0
+      for (const r of all) emit("close", r.profileSessionId)
       await Promise.race([
         Promise.all(all.map((r) => r.close())),
         new Promise<void>((resolve) => setTimeout(resolve, timeoutMs)),
       ])
+    },
+    get counters(): RuntimeLifecycleCounters {
+      return { ...counters }
+    },
+    emitLifecycle(event: RuntimeLifecycleEvent, profileSessionId: string): void {
+      emit(event, profileSessionId)
     },
   }
   return manager

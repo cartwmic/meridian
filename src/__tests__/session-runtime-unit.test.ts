@@ -398,6 +398,38 @@ describe("SessionRuntime — pending executions", () => {
     await runtime.close()
     await expect(runtime.registerPendingExecution("toolu_abc")).rejects.toThrow(/closed/)
   })
+
+  it("rejects a pending handler after the configured idle timeout (§5.12f)", async () => {
+    const runtime = createSessionRuntime({
+      profileSessionId: "p1",
+      query: (async function* () { /* empty */ })() as unknown as Query,
+      inputQueue: createAsyncQueue<SDKUserMessage>(),
+      pendingExecutionTimeoutMs: 20,
+    })
+    const pending = runtime.registerPendingExecution("toolu_abc")
+    const err = await pending.catch((e) => e)
+    expect(err).toBeInstanceOf(Error)
+    expect((err as Error).message).toMatch(/timed out after 20ms/)
+    expect(runtime.pendingCount).toBe(0)
+  })
+
+  it("does NOT arm an idle timeout when pendingExecutionTimeoutMs is unset (default = infinity)", async () => {
+    const runtime = createSessionRuntime({
+      profileSessionId: "p1",
+      query: (async function* () { /* empty */ })() as unknown as Query,
+      inputQueue: createAsyncQueue<SDKUserMessage>(),
+    })
+    const pending = runtime.registerPendingExecution("toolu_abc")
+    const racer = Promise.race([
+      pending.then(() => "resolved"),
+      new Promise<string>((r) => setTimeout(() => r("timeout-wait"), 30)),
+    ])
+    const outcome = await racer
+    expect(outcome).toBe("timeout-wait") // still pending; no timeout fired
+    // cleanup: resolve so the dangling promise doesn't warn on test exit
+    runtime.resolvePendingExecution("toolu_abc", "x")
+    await pending
+  })
 })
 
 describe("SessionRuntime — tool_use_id FIFO", () => {
@@ -492,6 +524,32 @@ describe("SessionRuntimeManager", () => {
     expect(mgr.get("stale")).toBeUndefined()
     expect(mgr.get("fresh")).toBe(fresh)
     expect(stale.closed).toBe(true)
+  })
+
+  it("emits lifecycle events + bumps counters (§7.2/§7.3)", async () => {
+    const events: Array<{ e: string; id: string }> = []
+    const mgr = createSessionRuntimeManager({
+      idleMs: 1000, maxLive: 4,
+      onLifecycle: (e, id) => events.push({ e, id }),
+    })
+    const a = makeRuntime("a", Date.now())
+    mgr.put(a)
+    expect(mgr.counters.creates).toBe(1)
+    expect(mgr.counters.live).toBe(1)
+    expect(events).toEqual([{ e: "create", id: "a" }])
+
+    mgr.put(a) // re-put same key → reattach, not create
+    expect(mgr.counters.creates).toBe(1)
+    expect(events[events.length - 1]).toEqual({ e: "reattach", id: "a" })
+
+    await mgr.drop("a")
+    expect(mgr.counters.live).toBe(0)
+    expect(events[events.length - 1]).toEqual({ e: "close", id: "a" })
+
+    const b = makeRuntime("b", Date.now() - 10_000)
+    mgr.put(b)
+    await mgr.sweepIdle()
+    expect(mgr.counters.evictions).toBe(1)
   })
 
   it("sweepIdle skips stale runtimes whose turn mutex is currently held (§3.12)", async () => {

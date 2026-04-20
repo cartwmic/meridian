@@ -17,6 +17,7 @@ import { createPassthroughMcpServer, stripMcpPrefix, computeToolSetKey, PASSTHRO
 import { LRUMap } from "../utils/lruMap"
 import { createSessionRuntimeManager, type SessionRuntimeManager } from "./session/runtime"
 import { startTurn, type TurnContext } from "./session/turnRunner"
+import { MutexAcquireTimeoutError } from "./session/persistentDispatch"
 
 import { telemetryStore, diagnosticLog, createTelemetryRoutes, landingHtml, renderPrometheusMetrics } from "../telemetry"
 import type { RequestMetric } from "../telemetry"
@@ -297,6 +298,10 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
   const runtimeManager: SessionRuntimeManager = createSessionRuntimeManager({
     idleMs: finalConfig.persistentSessionIdleMs ?? 900_000,
     maxLive: finalConfig.persistentSessionMaxLive ?? 32,
+    onLifecycle: (event, profileSessionId) => {
+      // §7.2 — emit runtime lifecycle events on the existing log channel.
+      claudeLog("persistent.lifecycle", { event, profileSessionId })
+    },
   })
   const persistentSweepInterval = setInterval(() => {
     runtimeManager.sweepIdle().catch((err) => {
@@ -1886,6 +1891,22 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
           durationMs: Date.now() - requestStartAt,
           error: errMsg
         })
+
+        // §5.10 — persistent-mode mutex acquisition timeout surfaces as
+        // HTTP 429 with a Retry-After header so callers can back off.
+        if (error instanceof MutexAcquireTimeoutError) {
+          const retryAfterSec = Math.max(1, Math.ceil(error.timeoutMs / 1000))
+          return new Response(
+            JSON.stringify({ type: "error", error: { type: "rate_limit_error", message: error.message } }),
+            {
+              status: 429,
+              headers: {
+                "Content-Type": "application/json",
+                "Retry-After": String(retryAfterSec),
+              },
+            },
+          )
+        }
 
         // Detect specific error types and return helpful messages
         const classified = classifyError(errMsg)

@@ -61,11 +61,24 @@ models.ts          → mapModelToClaudeModel, resolveClaudeExecutableAsync
 tools.ts           → BLOCKED_BUILTIN_TOOLS, CLAUDE_CODE_ONLY_TOOLS, MCP_SERVER_NAME
 messages.ts        → normalizeContent, getLastUserMessage (pure)
 fileChanges.ts     → PostToolUse hook: file write/edit tracking + summary formatting (pure)
+contentSanitizer.ts→ stripCacheControl (persistent-mode §D10 invariant)
+passthroughConstants.ts → PASSTHROUGH_MCP_NAME/PREFIX + stripMcpPrefix (leaf)
 session/
   lineage.ts       → Hashing, lineage verification (PURE — no I/O)
   fingerprint.ts   → extractClientCwd, getConversationFingerprint
   cache.ts         → LRU caches, lookupSession, storeSession (stateful)
+  runtime.ts       → SessionRuntime + manager (persistent mode; live query per session)
+  optionsClassifier.ts → Options drift classifier (reopen vs in-place) — PURE
+  persistentDispatch.ts→ One-turn dispatcher for persistent mode
+  persistentWiring.ts  → Construct CreateRuntimeFn for the dispatcher
+  turnRunner.ts    → startTurn: single entry server.ts calls; branches on the flag
 ```
+
+### Persistent-SDK-sessions mode (`config.persistentSessions`)
+
+Opt-in; off by default. When on (globally or via an adapter's `usesPersistentSessions()` override), meridian holds **one live SDK `query()` per logical session** across HTTP turns instead of calling `query({ resume })` per request. This eliminates the `resume`-path byte drift that invalidates Anthropic's prompt cache on every turn.
+
+Plugin authors: in persistent mode there is **one SDK subprocess per logical session** rather than per request. Any plugin that mutates per-request state (headers, env, working directory) MUST key that state by request rather than rely on subprocess identity.
 
 ## Stable API Contract
 

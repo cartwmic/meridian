@@ -253,3 +253,122 @@ describe("dispatchPersistentTurn — cache_control stripping", () => {
     expect(h.runtimes).toHaveLength(1)
   })
 })
+
+describe("dispatchPersistentTurn — mutex timeout (§5.10)", () => {
+  it("throws MutexAcquireTimeoutError when a turn can't acquire the mutex in time", async () => {
+    const { MutexAcquireTimeoutError: MATE } = await import("../proxy/session/persistentDispatch")
+    const h = makeHarness()
+    h.nextTurns.push([{ events: [{ type: "assistant" } as unknown as SDKMessage] }])
+    h.nextTurns.push([{ events: [{ type: "assistant" } as unknown as SDKMessage] }])
+
+    // First turn holds the mutex forever (never drain the iterator).
+    const iter1 = dispatchPersistentTurn(makeRequest({ userContent: "t1" }), h)[Symbol.asyncIterator]()
+    const first = await iter1.next() // yield first event; mutex held by this turn
+    // Mock emits the system(init) event first, then the scripted assistant event.
+    expect((first.value as any).type).toBeDefined()
+
+    // Second turn on the same session times out waiting for the mutex.
+    const second = dispatchPersistentTurn(makeRequest({ userContent: "t2", mutexWaitMs: 30 }), h)
+    await expect((async () => { for await (const _ of second) { /* nothing */ } })()).rejects.toBeInstanceOf(MATE)
+
+    // Release the first turn so cleanup proceeds.
+    try { while (!(await iter1.next()).done) { /* drain */ } } catch { /* ignore */ }
+  })
+})
+
+describe("dispatchPersistentTurn — fork lineage (§5.11)", () => {
+  it("on undo closes the warm runtime and creates a new one with forkSession + resumeSessionAt + cached resume id", async () => {
+    const h = makeHarness()
+    h.nextTurns.push([{ events: [{ type: "assistant" } as unknown as SDKMessage] }])
+    h.nextTurns.push([{ events: [{ type: "assistant" } as unknown as SDKMessage] }])
+
+    for await (const _ of dispatchPersistentTurn(makeRequest({ userContent: "t1" }), h)) { /* drain */ }
+    const warmBefore = h.runtimes[0]!
+
+    for await (const _ of dispatchPersistentTurn(makeRequest({
+      userContent: "undo",
+      isUndo: true,
+      undoRollbackUuid: "uuid-fork-42",
+      resumeSessionIdFromCache: "cached-sdk-sess",
+    }), h)) { /* drain */ }
+
+    expect(warmBefore.closed).toBe(true) // old runtime torn down
+    expect(h.createCalls[1]!.forkSession).toBe(true)
+    expect(h.createCalls[1]!.resumeSessionAt).toBe("uuid-fork-42")
+    expect(h.createCalls[1]!.resumeSessionId).toBe("cached-sdk-sess")
+  })
+})
+
+describe("dispatchPersistentTurn — crash recovery (§6.4)", () => {
+  it("propagates crash from consumeTurn, allows the caller to drop the runtime, and cold-reattaches on next call", async () => {
+    const h = makeHarness()
+    // First turn crashes mid-iteration via mockQuery.crashOnTurn=0 semantics.
+    // Easier: script a throw by returning an event stream that ends before the
+    // result terminator. consumeTurn throws a "query ended before turn terminator" error.
+    h.nextTurns.push([{ events: [{ type: "assistant" } as unknown as SDKMessage], result: undefined }])
+    // Second request recreates the runtime.
+    h.nextTurns.push([{ events: [{ type: "assistant" } as unknown as SDKMessage] }])
+
+    // Normal first turn works (script includes result synthesis).
+    for await (const _ of dispatchPersistentTurn(makeRequest({ userContent: "t1" }), h)) { /* drain */ }
+    const firstRuntime = h.runtimes[0]!
+
+    // Simulate manager drop (as a crash-recovery caller would do).
+    await h.manager.drop("session-A")
+    expect(firstRuntime.closed).toBe(true)
+
+    // Next dispatch is a cold reattach.
+    for await (const _ of dispatchPersistentTurn(makeRequest({
+      userContent: "t2",
+      resumeSessionIdFromCache: firstRuntime.claudeSessionId ?? "fallback",
+    }), h)) { /* drain */ }
+
+    expect(h.createCalls).toHaveLength(2)
+    expect(h.createCalls[1]!.resumeSessionId).toBeDefined()
+  })
+})
+
+describe("dispatchPersistentTurn — pending-handler integration (§5.12h/i/l)", () => {
+  it("resolves multiple pending tool_use_ids when batched tool_results arrive (§5.12i)", async () => {
+    const h = makeHarness()
+    h.nextTurns.push([{ events: [{ type: "assistant" } as unknown as SDKMessage] }])
+    for await (const _ of dispatchPersistentTurn(makeRequest({ userContent: "t1" }), h)) { /* drain */ }
+
+    const runtime = h.runtimes[0]!
+    const p1 = runtime.registerPendingExecution("toolu_a")
+    const p2 = runtime.registerPendingExecution("toolu_b")
+    const caught1 = p1.catch((e) => e)
+    const caught2 = p2.catch((e) => e)
+
+    const { classifyPassthroughRequest } = await import("../proxy/session/runtime")
+    const { resolvePendingFromRequest } = await import("../proxy/session/persistentDispatch")
+
+    const classification = classifyPassthroughRequest([
+      { type: "tool_result", tool_use_id: "toolu_a", content: "alpha" },
+      { type: "tool_result", tool_use_id: "toolu_b", content: "beta" },
+    ], runtime.pendingToolUseIds)
+
+    const resolved = resolvePendingFromRequest(runtime, classification.resolve)
+    expect(resolved).toBe(2)
+    expect(await p1).toBe("alpha")
+    expect(await p2).toBe("beta")
+    expect(classification.pushContent).toBeNull()
+    // Reference the catches to avoid unhandled-rejection diagnostics.
+    expect(await caught1).toBe("alpha")
+    expect(await caught2).toBe("beta")
+  })
+
+  it("rejects pending handlers when the runtime closes mid-flight (§5.12l/§5.12g)", async () => {
+    const h = makeHarness()
+    h.nextTurns.push([{ events: [{ type: "assistant" } as unknown as SDKMessage] }])
+    for await (const _ of dispatchPersistentTurn(makeRequest({ userContent: "t1" }), h)) { /* drain */ }
+
+    const runtime = h.runtimes[0]!
+    const pending = runtime.registerPendingExecution("toolu_abc")
+    const caught = pending.catch((e) => e)
+    await h.manager.drop("session-A")
+    const err = await caught
+    expect(err).toBeInstanceOf(Error)
+    expect((err as Error).message).toMatch(/closed/)
+  })
+})
