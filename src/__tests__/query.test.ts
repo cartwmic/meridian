@@ -161,6 +161,16 @@ describe("buildQueryOptions", () => {
     expect(env.ENABLE_CLAUDEAI_MCP_SERVERS).toBeUndefined()
   })
 
+  it("enables strict MCP config in passthrough mode (suppresses ambient ~/.claude.json MCP servers)", () => {
+    const result = buildQueryOptions(makeContext({ passthrough: true }))
+    expect((result.options as any).strictMcpConfig).toBe(true)
+  })
+
+  it("does not enable strict MCP config in normal mode", () => {
+    const result = buildQueryOptions(makeContext({ passthrough: false }))
+    expect((result.options as any).strictMcpConfig).toBeUndefined()
+  })
+
   it("includes hooks when provided", () => {
     const hooks = { PreToolUse: [{ matcher: "Task", hooks: [] }] }
     const result = buildQueryOptions(makeContext({ sdkHooks: hooks }))

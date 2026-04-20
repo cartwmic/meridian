@@ -149,6 +149,16 @@ export function buildQueryOptions(ctx: QueryContext): BuildQueryResult {
       ...(passthrough
         ? {
             disallowedTools: blockedTools,
+            // Only use the synthetic passthrough MCP server injected here.
+            // Without `strictMcpConfig`, the SDK also loads MCP servers
+            // configured in the user's ~/.claude.json (or project/CLI
+            // settings). Those ambient servers bypass meridian's passthrough:
+            // the SDK executes the tool internally, the tool_use never
+            // streams to the client, and the client's session log is
+            // missing the MCP tool trail (even though the data reaches the
+            // model). Strict mode restricts the SDK to only meridian's
+            // injected server(s).
+            strictMcpConfig: true,
             ...(passthroughMcp ? {
               allowedTools: passthroughMcp.toolNames,
               mcpServers: { [PASSTHROUGH_MCP_NAME]: passthroughMcp.server },
