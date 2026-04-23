@@ -140,24 +140,13 @@ export const piAdapter: AgentAdapter = {
 
   /**
    * Pi handles its own tool execution loop (standard Anthropic tool_use /
-   * tool_result cycle). Passthrough is the ONLY path through which pi's
-   * local tools — `web_search` (pi-codex-web-search), `read`/`write`/`edit`/
-   * `bash`, `subagent`, and any pi-registered extensions — reach the model.
-   * Without passthrough, pi's `body.tools` is discarded server-side and the
-   * SDK falls back to its own tool config (`~/.claude.json` MCP servers
-   * only); the model then correctly reports "no web_search tool available"
-   * because none was ever exposed.
+   * tool_result cycle). Passthrough mode is appropriate: the proxy returns
+   * tool_use blocks to pi, which executes them and sends back tool_results.
    *
-   * Default ON, matching opencode, with opt-out via env var so operators
-   * who genuinely want the legacy path can set `MERIDIAN_PASSTHROUGH=0`.
+   * Like Crush, defer to CLAUDE_PROXY_PASSTHROUGH env var so the same
+   * global setting controls both agents.
    */
-  usesPassthrough(): boolean {
-    const envVal = process.env.MERIDIAN_PASSTHROUGH ?? process.env.CLAUDE_PROXY_PASSTHROUGH
-    if (envVal === "0" || envVal === "false" || envVal === "no") {
-      return false
-    }
-    return true
-  },
+  // usesPassthrough not defined — defers to CLAUDE_PROXY_PASSTHROUGH env var
 
   /**
    * Pi uses lowercase tool names: read, write, edit, bash.
