@@ -233,6 +233,74 @@ describe("SessionRuntime", () => {
     await runtime.close()
     await expect(runtime.acquireTurn()).rejects.toThrow(/closed/)
   })
+
+  it("fires onTurnAborted when consumeTurn exits without the terminator (mid-turn abort)", async () => {
+    // Reproduces scenario T in the live-validation playbook: client aborts
+    // mid-stream (pi ESC), consumer stops reading before the `result`
+    // terminator. onTurnAborted must fire so the owner can drop the runtime
+    // and the next HTTP turn cold-reattaches with a clean message_start
+    // instead of pulling the continuation of the aborted message.
+    let aborted = 0
+    const events: SDKMessage[] = [
+      { type: "system", subtype: "init" } as unknown as SDKMessage,
+      { type: "assistant" } as unknown as SDKMessage,
+      { type: "assistant" } as unknown as SDKMessage,
+      { type: "result", subtype: "success" } as unknown as SDKMessage,
+    ]
+    const runtime = createSessionRuntime({
+      profileSessionId: "p1",
+      query: fakeQuery(events),
+      inputQueue: createAsyncQueue<SDKUserMessage>(),
+      onTurnAborted: () => { aborted++ },
+    })
+    // Consume ONE event and bail — the generator's .return() hook fires as
+    // the for-await loop is abandoned.
+    for await (const _ of runtime.consumeTurn()) {
+      break
+    }
+    expect(aborted).toBe(1)
+  })
+
+  it("does NOT fire onTurnAborted when consumeTurn reaches the terminator naturally", async () => {
+    let aborted = 0
+    const events: SDKMessage[] = [
+      { type: "assistant" } as unknown as SDKMessage,
+      { type: "result", subtype: "success" } as unknown as SDKMessage,
+    ]
+    const runtime = createSessionRuntime({
+      profileSessionId: "p1",
+      query: fakeQuery(events),
+      inputQueue: createAsyncQueue<SDKUserMessage>(),
+      onTurnAborted: () => { aborted++ },
+    })
+    const seen: SDKMessage[] = []
+    for await (const m of runtime.consumeTurn()) seen.push(m)
+    expect(seen.length).toBe(2)
+    expect(aborted).toBe(0)
+  })
+
+  it("does NOT fire onTurnAborted when the runtime is already closed", async () => {
+    let aborted = 0
+    const events: SDKMessage[] = [
+      { type: "assistant" } as unknown as SDKMessage,
+      { type: "assistant" } as unknown as SDKMessage,
+      { type: "result", subtype: "success" } as unknown as SDKMessage,
+    ]
+    const runtime = createSessionRuntime({
+      profileSessionId: "p1",
+      query: fakeQuery(events),
+      inputQueue: createAsyncQueue<SDKUserMessage>(),
+      onTurnAborted: () => { aborted++ },
+    })
+    // Close before the consumer bails — simulates the shutdown path where
+    // closeAll() tears down runtimes that happen to have an unfinished turn.
+    // onTurnAborted should NOT double-fire on top of close().
+    for await (const _ of runtime.consumeTurn()) {
+      await runtime.close()
+      break
+    }
+    expect(aborted).toBe(0)
+  })
 })
 
 describe("classifyPassthroughRequest", () => {

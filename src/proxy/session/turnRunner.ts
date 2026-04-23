@@ -135,6 +135,20 @@ async function* runPersistent(ctx: TurnContext & { profileSessionId: string }, d
 
   const wiringDeps: PersistentWiringDeps = {
     pendingExecutionTimeoutMs: deps.config.persistentPendingExecutionTimeoutMs,
+    // Mid-turn client abort (pi ESC → cancelled SSE stream): drop the runtime
+    // so the next HTTP turn cold-reattaches via `resume` and gets a clean
+    // `message_start`. Without this the next `consumeTurn` pulls the
+    // continuation of the aborted message and fails strict SSE validation
+    // with "content_block_delta before message_start". drop() is
+    // synchronous in its map.delete; await is only for the close(),
+    // making fire-and-forget safe.
+    onTurnAborted: (profileSessionId) => {
+      claudeLog("persistent.turn_aborted", {
+        mode: "persistent",
+        profileSessionId,
+      })
+      void deps.manager.drop(profileSessionId)
+    },
     startQuery: ({ inputQueue, options }) => sdkQuery({ prompt: inputQueue as AsyncIterable<SDKUserMessage>, options }) as Query,
     buildOptions: ({ reopenCritical, inPlace, resumeSessionId, forkSession, resumeSessionAt, passthroughMcpBinding, sdkHooksBinding }) => {
       // Re-run buildQueryOptions with a ctx that reflects the

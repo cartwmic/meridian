@@ -92,6 +92,16 @@ export interface PersistentWiringDeps {
    * (§5.12f). Default `Infinity` (no timeout).
    */
   pendingExecutionTimeoutMs?: number
+
+  /**
+   * Fires when `consumeTurn` exits without reaching the turn terminator
+   * (caller bailed mid-turn — e.g. pi ESC → HTTP stream cancelled). Wired
+   * by `turnRunner` to drop the runtime from the manager so the next HTTP
+   * turn cold-reattaches via `resume` instead of pulling the continuation
+   * of the aborted message. See `SessionRuntimeInit.onTurnAborted` for the
+   * full rationale.
+   */
+  onTurnAborted?: (profileSessionId: string) => void
 }
 
 /** Late-bound reference to the runtime that the MCP handlers close over. */
@@ -167,6 +177,9 @@ export function makePersistentCreateRuntime(deps: PersistentWiringDeps): CreateR
       query,
       inputQueue,
       pendingExecutionTimeoutMs: deps.pendingExecutionTimeoutMs,
+      onTurnAborted: deps.onTurnAborted
+        ? () => deps.onTurnAborted!(args.profileSessionId)
+        : undefined,
     })
 
     // Bind the late reference so MCP handlers + hook can now reach runtime.

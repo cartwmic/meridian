@@ -363,6 +363,35 @@ export interface SessionRuntimeInit {
    * ceiling by setting this field.
    */
   pendingExecutionTimeoutMs?: number
+  /**
+   * Fires when `consumeTurn` exits without reaching the turn terminator
+   * (caller bailed mid-turn — typically pi ESC → HTTP stream cancelled).
+   *
+   * **Why it exists.** In persistent mode the SDK's async iterator is
+   * paused at a `yield` mid-message when the consumer stops reading. The
+   * SDK does not know the HTTP consumer is gone, so on the NEXT turn the
+   * first `queryIter.next()` yields the continuation of the aborted
+   * message — starting with `content_block_delta` or an `assistant`
+   * rebuild event, not `message_start`. Strict SSE clients reject this
+   * as "Unexpected event order, got content_block_delta before
+   * message_start" and record an empty assistant response. Subsequent
+   * user turns keep landing on continuations of prior aborted messages,
+   * producing a cascade of empty replies until the user forks the
+   * conversation tree.
+   *
+   * **What the callback should do.** Tear down the runtime and remove it
+   * from the manager so the next HTTP turn cold-reattaches via `resume`
+   * and gets a clean `message_start`. `manager.drop(profileSessionId)`
+   * synchronously deletes from the map and fires async close — safe to
+   * invoke fire-and-forget here because the SDK subprocess exit and the
+   * new HTTP request's cold-reattach are independent.
+   *
+   * The callback runs inside `consumeTurn`'s `finally`, which fires BEFORE
+   * the outer `release()` in `dispatchPersistentTurn`, so the manager map
+   * is cleaned up before the turn mutex is released. The next incoming
+   * turn that races in sees an absent runtime and builds fresh.
+   */
+  onTurnAborted?: () => void
 }
 
 export interface SessionRuntime {
@@ -473,6 +502,7 @@ export function createSessionRuntime(init: SessionRuntimeInit): SessionRuntime {
     },
     get turnInFlight(): boolean { return mutex.locked },
     async *consumeTurn(): AsyncIterable<SDKMessage> {
+      let terminated = false
       try {
         while (true) {
           const step: IteratorResult<SDKMessage, void> = await queryIter.next()
@@ -484,11 +514,23 @@ export function createSessionRuntime(init: SessionRuntimeInit): SessionRuntime {
           const sid = (message as { session_id?: unknown }).session_id
           if (typeof sid === "string" && !claudeSessionId) claudeSessionId = sid
           yield message
-          if (isTurnTerminator(message)) return
+          if (isTurnTerminator(message)) {
+            terminated = true
+            return
+          }
         }
       } catch (err) {
         if (!closed) init.onCrash?.(err)
         throw err
+      } finally {
+        // Caller bailed mid-turn (generator .return() propagated from a
+        // broken SSE stream / client abort). See SessionRuntimeInit.
+        // onTurnAborted for the full rationale. Only fire on unclean exit
+        // — `terminated` guards normal completion, `closed` guards the
+        // shutdown path where the runtime is already being torn down.
+        if (!terminated && !closed) {
+          try { init.onTurnAborted?.() } catch { /* swallow */ }
+        }
       }
     },
     async close(): Promise<void> {

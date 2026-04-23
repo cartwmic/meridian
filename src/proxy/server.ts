@@ -1261,6 +1261,18 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
         }
 
         const encoder = new TextEncoder()
+        // Client abort signal — Hono exposes the raw Request's AbortSignal
+        // which Bun fires as soon as the underlying TCP connection is closed.
+        // Meridian must react to this proactively; otherwise the inner
+        // `for await` in start() keeps pulling SDK events long after pi has
+        // hung up, holding the persistent-runtime mutex and making the next
+        // turn wait until the 30 s mutex-acquire timeout → timeout_error.
+        // With this listener the outer loop breaks immediately, which
+        // propagates `.return()` down to `runtime.consumeTurn()` whose
+        // finally block invokes `onTurnAborted` → the runtime is dropped
+        // and the next turn cold-reattaches with a clean message_start.
+        const clientSignal = c.req.raw?.signal
+        let clientAborted = clientSignal?.aborted ?? false
         const readable = new ReadableStream({
           async start(controller) {
             const upstreamStartAt = Date.now()
@@ -1270,7 +1282,15 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
             let eventsForwarded = 0
             let textEventsForwarded = 0
             let bytesSent = 0
-            let streamClosed = false
+            let streamClosed = clientAborted
+
+            if (clientSignal && !clientAborted) {
+              clientSignal.addEventListener("abort", () => {
+                clientAborted = true
+                streamClosed = true
+                claudeLog("stream.client_aborted", { streamEventsSeen, eventsForwarded })
+              }, { once: true })
+            }
 
             claudeLog("upstream.start", { mode: "stream", model })
 
