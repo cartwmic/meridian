@@ -457,6 +457,15 @@ export interface SessionRuntime {
    */
   enqueueToolUseId(toolName: string, toolUseId: string): void
   dequeueToolUseId(toolName: string): string | undefined
+
+  /**
+   * Marks the current turn as a legitimate turnRunner pause (not a client
+   * abort). Call this immediately before yielding a synthetic pending-pause
+   * result + returning from the turnRunner generator. consumeTurn's finally
+   * reads the flag to decide whether to fire `onTurnAborted`. The flag is
+   * consumed (reset) on the same finally pass, so it's per-turn state.
+   */
+  markTurnPause(): void
 }
 
 export function createSessionRuntime(init: SessionRuntimeInit): SessionRuntime {
@@ -484,6 +493,15 @@ export function createSessionRuntime(init: SessionRuntimeInit): SessionRuntime {
   // tool_use_id has fired (parallel tool_use blocks — SDK fires handlers
   // sequentially). Drained by registerPendingExecution on later registration.
   const prebound = new Map<string, string>()
+
+  // Explicit "this turn is a legitimate pause, not an abort" flag set by
+  // turnRunner just before its early-exit yields the synthetic `result` and
+  // returns its generator. The `.return()` cascade through the for-await
+  // chain makes consumeTurn exit via its finally block without seeing a
+  // terminator, which is indistinguishable from a client TCP-close abort
+  // at the generator level. This flag disambiguates: pause → skip abort
+  // handling; real client abort → drop runtime. See consumeTurn's finally.
+  let pausingThisTurn = false
 
   const runtime: SessionRuntime = {
     profileSessionId: init.profileSessionId,
@@ -523,23 +541,23 @@ export function createSessionRuntime(init: SessionRuntimeInit): SessionRuntime {
         if (!closed) init.onCrash?.(err)
         throw err
       } finally {
-        // Caller bailed mid-turn (generator .return() propagated from a
-        // broken SSE stream / client abort). See SessionRuntimeInit.
-        // onTurnAborted for the full rationale. Only fire on unclean exit
-        // — `terminated` guards normal completion, `closed` guards the
-        // shutdown path where the runtime is already being torn down.
+        // Disambiguate two ways a for-await breaks this generator without
+        // a terminator:
         //
-        // `pending.size === 0` gate: turnRunner's legitimate pending-tools
-        // pause path (message_stop + pendingCount > 0) also exits this
-        // generator via .return() cascade without a terminator, since the
-        // synthetic `result` is yielded by turnRunner NOT by consumeTurn.
-        // If handlers are pending, the SDK subprocess is still alive mid-
-        // turn waiting for the client's tool_results, and dropping the
-        // runtime here poisons the next HTTP turn's cold-reattach
-        // (prebound tool_results have no handler to drain them). Treat
-        // "broken exit with pending handlers" as a benign pause rather
-        // than a client abort.
-        if (!terminated && !closed && pending.size === 0) {
+        // 1. `pausingThisTurn` set by turnRunner / server.ts before a
+        //    legitimate pause (passthrough tool-use break, parallel-tool
+        //    pending-pause, etc.) — the SDK is still alive mid-turn and
+        //    the runtime MUST stay warm.
+        // 2. Client TCP-close / mid-stream abort (pi ESC). The SDK's
+        //    in-flight turn is abandoned; the runtime must be dropped so
+        //    the next HTTP turn cold-reattaches (or takes the cold-start
+        //    seed path) with clean session state.
+        //
+        // `terminated` guards normal turn completion; `closed` guards the
+        // shutdown path where the runtime is already being torn down.
+        const wasPausing = pausingThisTurn
+        pausingThisTurn = false
+        if (!terminated && !closed && !wasPausing) {
           try { init.onTurnAborted?.() } catch { /* swallow */ }
         }
       }
@@ -688,6 +706,10 @@ export function createSessionRuntime(init: SessionRuntimeInit): SessionRuntime {
       const id = queue.shift()
       if (queue.length === 0) toolUseIdFifo.delete(toolName)
       return id
+    },
+
+    markTurnPause(): void {
+      pausingThisTurn = true
     },
   }
   return runtime

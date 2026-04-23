@@ -67,6 +67,18 @@ export interface TurnRunnerDeps {
    * `session/cache.ts` stays consistent with disk.
    */
   onSessionIdCaptured?: (profileSessionId: string, claudeSessionId: string) => void
+  /**
+   * Called when a runtime is dropped mid-turn due to a client abort (NOT a
+   * legitimate turnRunner pause). Server.ts wires this to evict the
+   * session/cache.ts entry so the NEXT HTTP turn takes the cold-start-
+   * with-history seed path (scenario U) instead of resuming an SDK session
+   * whose on-disk state already contains the trailing tool_result the next
+   * request will carry. Without eviction, the dispatcher prebinds the
+   * tool_result against an empty pending registry, nothing is pushed to
+   * the SDK input queue, and the cold-reattached runtime deadlocks waiting
+   * for input while pi waits for SSE events (scenario W).
+   */
+  onSessionAborted?: (profileSessionId: string) => void
 }
 
 // --- Helpers ---------------------------------------------------------------
@@ -148,6 +160,16 @@ async function* runPersistent(ctx: TurnContext & { profileSessionId: string }, d
         profileSessionId,
       })
       void deps.manager.drop(profileSessionId)
+      // Evict session/cache.ts entry too. The SDK's on-disk session state
+      // for the dropped runtime may contain a just-persisted tool_result
+      // that the NEXT HTTP turn will re-send (pi replays the full
+      // transcript). Resuming from that state + prebinding the duplicate
+      // tool_result deadlocks (dispatcher pushes nothing, SDK awaits
+      // input). Evicting forces the next turn to fall through the
+      // cold-start-with-history seed path in server.ts (§ scenario U
+      // fix, commit 7f2df01) which pushes the full textPrompt and
+      // produces a valid first turn on a fresh SDK session.
+      try { deps.onSessionAborted?.(profileSessionId) } catch { /* swallow */ }
     },
     startQuery: ({ inputQueue, options }) => sdkQuery({ prompt: inputQueue as AsyncIterable<SDKUserMessage>, options }) as Query,
     buildOptions: ({ reopenCritical, inPlace, resumeSessionId, forkSession, resumeSessionAt, passthroughMcpBinding, sdkHooksBinding }) => {
@@ -328,6 +350,11 @@ async function* runPersistent(ctx: TurnContext & { profileSessionId: string }, d
         // non-streaming turns buffer the whole response server-side so
         // SSE framing doesn't apply.
         if (ctx.stream) markRuntimeContinuation(runtime)
+        // Signal consumeTurn's finally that this is a legitimate pause so
+        // the .return() cascade that follows our `return` below is NOT
+        // treated as a client abort. Without this, the runtime would be
+        // dropped on every parallel-tool pause (scenario V regression).
+        runtime.markTurnPause()
         yield makePendingPauseResult(runtime.claudeSessionId, ctx.stream)
         return
       }

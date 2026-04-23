@@ -876,10 +876,33 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
             claudeLog("persistent.storeSession_error", { err: err instanceof Error ? err.message : String(err) })
           }
         }
+        // Set by `onSessionAborted` when the runtime is dropped mid-turn
+        // due to a client abort. Read at end-of-stream so the post-turn
+        // storeSession doesn't race the eviction and resurrect the
+        // invalidated cache entry (scenario W).
+        let sessionWasEvicted = false
         const persistentDeps = {
           config: finalConfig,
           manager: runtimeManager,
           onSessionIdCaptured: (_profileSessionId: string, sid: string) => persistentOnSessionIdCaptured(sid),
+          // Evict the session/cache.ts entry whenever a runtime is dropped
+          // due to a mid-turn client abort. The NEXT HTTP turn then finds
+          // no cachedSession and takes the cold-start-with-history seed
+          // path in server.ts (§7f2df01) rather than resuming an SDK
+          // session whose persisted state may contain a just-written
+          // tool_result that the re-sent continuation would duplicate
+          // and deadlock on (scenario W).
+          onSessionAborted: (pSessionId: string) => {
+            claudeLog("persistent.evictOnAbort", { profileSessionId: pSessionId })
+            sessionWasEvicted = true
+            try {
+              evictSession(pSessionId, profileScopedCwd, body.messages || [])
+            } catch (err) {
+              claudeLog("persistent.evictOnAbort_error", {
+                err: err instanceof Error ? err.message : String(err),
+              })
+            }
+          },
         }
 
         if (!stream) {
@@ -1674,6 +1697,14 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                             `event: message_stop\ndata: ${JSON.stringify({ type: "message_stop" })}\n\n`
                           ), "passthrough_turn2_stop")
                           claudeLog("passthrough.turn2_suppressed", { mode: "stream", toolUses: streamedToolUseIds.size })
+                          // Legitimate pause — pi will execute tools and send tool_result
+                          // in the next HTTP turn. Signal markTurnPause so consumeTurn's
+                          // finally does NOT fire onTurnAborted (which would drop the
+                          // runtime + evict the session cache mid-turn).
+                          if (effectivePersistentSessionId) {
+                            const runtimeForPause = runtimeManager.get(effectivePersistentSessionId)
+                            runtimeForPause?.markTurnPause()
+                          }
                           streamClosed = true
                           controller.close()
                           break
@@ -1769,12 +1800,25 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                     // and send results back. Without this the SDK executes the passthrough
                     // MCP no-op (→ "passthrough"), feeds that back to the model, and the
                     // model produces an incorrect fallback response which gets forwarded.
+                    //
+                    // Persistent-mode invariant: this break is a LEGITIMATE pause (pi
+                    // is about to execute the tool locally and return the result in a
+                    // new HTTP turn), not a client abort. Signal markTurnPause() on the
+                    // live runtime so `consumeTurn`'s finally does NOT fire
+                    // `onTurnAborted` → drop. Dropping here would invalidate the
+                    // session cache on every passthrough tool turn — exactly the
+                    // runaway we observed (every turn aborting, lineage=new on every
+                    // request, cache=0% forever).
                     if (
                       passthrough &&
                       eventType === "message_delta" &&
                       (event as any).delta?.stop_reason === "tool_use" &&
                       streamedToolUseIds.size > 0
                     ) {
+                      if (effectivePersistentSessionId) {
+                        const runtimeForPause = runtimeManager.get(effectivePersistentSessionId)
+                        runtimeForPause?.markTurnPause()
+                      }
                       safeEnqueue(
                         encoder.encode(`event: message_stop\ndata: ${JSON.stringify({ type: "message_stop" })}\n\n`),
                         "passthrough_tool_stream_stop"
@@ -1818,7 +1862,25 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
               // Store session for future resume.
               // Fork/subagent requests don't write to the cache (see lookupSession
               // block for rationale).
-              if (currentSessionId && !isIndependentSession) {
+              //
+              // Skip the store when the client aborted: persistent-mode's
+              // `onSessionAborted` callback just evicted this session, and
+              // rewriting it here would resurrect the cache entry we're
+              // trying to invalidate (scenario W). Next turn then resumes
+              // an SDK session whose on-disk state contains an in-flight
+              // assistant turn / just-written tool_result, and the cold-
+              // reattach deadlocks. Letting the eviction stick means the
+              // next turn takes the cold-start-with-history seed path
+              // (§7f2df01) on a fresh SDK session.
+              // Skip when persistent-mode has already evicted the session
+              // via onSessionAborted (mid-turn client abort). Otherwise
+              // this post-turn storeSession resurrects the invalidated
+              // cache entry, and the next HTTP turn resumes a poisoned
+              // SDK session → cold-reattach deadlock (scenario W).
+              // Legitimate passthrough pauses do NOT set sessionWasEvicted
+              // (they set markTurnPause on the runtime), so this gate
+              // preserves the cache across passthrough tool turns.
+              if (currentSessionId && !isIndependentSession && !sessionWasEvicted) {
                 storeSession(profileSessionId, body.messages || [], currentSessionId, profileScopedCwd, sdkUuidMap, lastUsage)
               }
 

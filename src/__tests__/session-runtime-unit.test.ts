@@ -302,12 +302,13 @@ describe("SessionRuntime", () => {
     expect(aborted).toBe(0)
   })
 
-  it("does NOT fire onTurnAborted when pending handlers exist at break (scenario V)", async () => {
+  it("does NOT fire onTurnAborted when markTurnPause was called (scenario V)", async () => {
     // turnRunner's legitimate message_stop + pendingCount>0 pause path
-    // breaks out of consumeTurn via .return() cascade (no terminator seen).
-    // That must NOT be treated as a client abort — dropping the runtime
-    // while handlers are awaiting the client's tool_results poisons the
-    // next turn's cold-reattach. Pending>0 is the discriminator.
+    // calls runtime.markTurnPause() before yielding the synthetic result
+    // and returning its generator. The .return() cascade exits consumeTurn
+    // via finally without a terminator. The pause flag must suppress
+    // onTurnAborted so the runtime stays warm while handlers await the
+    // client's tool_results.
     let aborted = 0
     const events: SDKMessage[] = [
       { type: "assistant" } as unknown as SDKMessage,
@@ -320,15 +321,68 @@ describe("SessionRuntime", () => {
       inputQueue: createAsyncQueue<SDKUserMessage>(),
       onTurnAborted: () => { aborted++ },
     })
-    // Simulate a pending deferred handler (passthrough tool awaiting
-    // client's tool_result). Don't await the promise — we want the entry
-    // to remain in the pending registry when the for-await breaks.
     void runtime.registerPendingExecution("toolu_pending_1")
     for await (const _ of runtime.consumeTurn()) {
+      runtime.markTurnPause()  // turnRunner signals pause before returning
       break
     }
     expect(runtime.pendingCount).toBe(1)
     expect(aborted).toBe(0)
+  })
+
+  it("DOES fire onTurnAborted when pending handlers exist but no pause marked (scenario W)", async () => {
+    // Real client abort (TCP close) while the SDK is mid-tool-use emission
+    // with a pending handler registered. Without markTurnPause, this is an
+    // abort — runtime must be dropped, otherwise the next user turn pushes
+    // content into an SDK subprocess still waiting for a tool_result that
+    // will never arrive, deadlocking the mutex.
+    let aborted = 0
+    const events: SDKMessage[] = [
+      { type: "assistant" } as unknown as SDKMessage,
+      { type: "assistant" } as unknown as SDKMessage,
+      { type: "result", subtype: "success" } as unknown as SDKMessage,
+    ]
+    const runtime = createSessionRuntime({
+      profileSessionId: "p1",
+      query: fakeQuery(events),
+      inputQueue: createAsyncQueue<SDKUserMessage>(),
+      onTurnAborted: () => { aborted++ },
+    })
+    void runtime.registerPendingExecution("toolu_pending_1")
+    for await (const _ of runtime.consumeTurn()) {
+      break  // client aborted, no markTurnPause called
+    }
+    expect(runtime.pendingCount).toBe(1)
+    expect(aborted).toBe(1)
+  })
+
+  it("markTurnPause is consumed per-turn (next turn starts fresh)", async () => {
+    // A pause on one turn must NOT carry over to the next turn's abort
+    // detection. Otherwise a pause-then-abort sequence on the same runtime
+    // would erroneously skip onTurnAborted on the abort.
+    let aborted = 0
+    const runtime = createSessionRuntime({
+      profileSessionId: "p1",
+      query: fakeQuery([
+        { type: "assistant" } as unknown as SDKMessage,
+        { type: "result", subtype: "success" } as unknown as SDKMessage,
+        { type: "assistant" } as unknown as SDKMessage,
+        { type: "assistant" } as unknown as SDKMessage,
+      ]),
+      inputQueue: createAsyncQueue<SDKUserMessage>(),
+      onTurnAborted: () => { aborted++ },
+    })
+    // Turn 1: pause
+    for await (const _ of runtime.consumeTurn()) {
+      runtime.markTurnPause()
+      break
+    }
+    expect(aborted).toBe(0)
+    // Turn 2: real abort (no pause mark)
+    for await (const _ of runtime.consumeTurn()) {
+      break
+    }
+    expect(aborted).toBe(1)
   })
 })
 
